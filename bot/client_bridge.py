@@ -13,6 +13,10 @@ import network
 
 LOGGING = True
 BOT_READY_SIGNAL = 'READY'
+#advanced loggings
+LOG_DIR = os.path.join(os.getcwd(), "logs")
+#advanced loggings
+
 
 class Logger:
 
@@ -52,6 +56,7 @@ class Logger:
         with self.lock:
             self.f.close()
 
+
 class SubmissionManager():
     socket: socket.socket
     # Pylint doesn't find `Process`
@@ -61,10 +66,12 @@ class SubmissionManager():
     def __init__(self, judge_address: str, exe_cmd: list[str],
                  init_timeout: float) -> None:
         if LOGGING:
-            self.logger = Logger(
-                'communication.'
-                f'{datetime.datetime.now().strftime("%Y%m%d_%H%M%S.%f")[:-3]}'
-                '.log')
+            #advanced loggings
+            os.makedirs(LOG_DIR, exist_ok=True)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S.%f")[:-3]
+            log_path = os.path.join(LOG_DIR, f"communication.{ts}.log")
+            self.logger = Logger(log_path)
+            #advanced loggings
         else:
             self.logger = None
         self._judge_address = judge_address
@@ -185,6 +192,7 @@ class SubmissionManager():
         if self.logger is not None:
             self.logger.close()
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=
@@ -207,6 +215,7 @@ def parse_args() -> argparse.Namespace:
         'seconds.')
     return parser.parse_args()
 
+
 def get_execute_command(fname: str) -> list[str]:
     """
     Return the command to execute the bot
@@ -222,6 +231,7 @@ def get_execute_command(fname: str) -> list[str]:
     print('Error: unknown filetype. Exiting.', file=sys.stderr)
     return []
 
+
 def main():
     args = parse_args()
     cmd = get_execute_command(args.bot_exe)
@@ -233,6 +243,7 @@ def main():
     except KeyboardInterrupt:
         manager.close()
         print('Received keyboard interrupt. Bye.')
+
 
 if __name__ == "__main__":
     main()
