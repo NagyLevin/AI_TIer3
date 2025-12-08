@@ -120,10 +120,8 @@ def _update_world_model(
       * builds a "planning" map (visible_track) as a copy of the updated
         world_model.
 
-    IMPORTANT CHANGE:
-      - visible_track most már NEM tölti ki a teljes pályát WALL-lal.
-        Ehelyett a world_model aktuális állapotát használjuk, így az
-        ismeretlen cellák (NOT_VISIBLE) nem blokkolják a mozgást.
+    FONTOS: visible_track most már a world_model másolata, az ismeretlen
+    cellákat nem tekintjük automatikusan falnak (csak WALL blokkol).
     """
     height, width = track_shape
 
@@ -167,7 +165,7 @@ def read_observation(old_state: State) -> Optional[State]:
     Reads the observation for the current turn from stdin and returns
     a new State.
 
-    The input format (per turn) is:
+    Input per turn:
       * one line with:  posx posy velx vely  (our agent)
       * num_players lines with: pposx pposy   (other players)
       * (2 * visibility_radius + 1) lines with the local map
@@ -185,13 +183,10 @@ def read_observation(old_state: State) -> Optional[State]:
 
     circuit_data = old_state.circuit
 
-    # Read the positions of all players (velocity of the others is unknown
-    # for us, so we keep vel=(0,0) as a placeholder).
     for _ in range(circuit_data.num_players):
         pposx, pposy = map(int, input().split())
         players.append(Player(pposx, pposy, 0, 0))
 
-    # Build new planning map and update persistent world model
     visible_track, world_model = _update_world_model(
         old_state.world_model.copy(),
         posx,
@@ -200,8 +195,6 @@ def read_observation(old_state: State) -> Optional[State]:
         circuit_data.track_shape,
     )
 
-    # After updating the world model, immediately dump it to a file so we
-    # can inspect what the agent currently knows about the world.
     save_world_model(world_model)
 
     return old_state._replace(
@@ -214,8 +207,7 @@ def read_observation(old_state: State) -> Optional[State]:
 
 def save_world_model(world_model: np.ndarray, fname: str = "logs/agentmap.txt") -> None:
     """
-    Saves the current world model into a text file so that it looks similar
-    to the task description.
+    Saves the current world model into a text file (row of integers per line).
     """
     os.makedirs(os.path.dirname(fname), exist_ok=True)
     with open(fname, "w", encoding="utf-8") as f:
@@ -229,9 +221,8 @@ def traversable(cell_value: int) -> bool:
     Returns True if the given cell value is considered traversable
     for path-checking purposes in the local planning map.
 
-    IMPORTANT CHANGE:
-      - Az ismeretlen cellákat (NOT_VISIBLE, UNKNOWN) most már
-        járhatónak tekintjük. Csak a tényleges WALL blokkol.
+    Csak a WALL (és a pályán kívüli rész) blokkol, az ismeretlen / homok /
+    olaj átjárható, csak nem kívánatos.
     """
     return cell_value != CellType.WALL.value
 
@@ -241,18 +232,18 @@ def valid_line(state: State, pos1: np.ndarray, pos2: np.ndarray) -> bool:
     Checks whether the straight line from pos1 to pos2 is free from walls
     on the current planning map (state.visible_track).
 
-    This uses our updated traversable() where unknown cells are traversable.
+    Uses traversable(), így a homok/olaj/unknown átjárható,
+    de a fal blokkol.
     """
     assert state.visible_track is not None, "visible_track not initialised yet."
     track = state.visible_track
-    if (np.any(pos1 < 0) or np.any(pos2 < 0) or np.any(pos1 >= track.shape)
-            or np.any(pos2 >= track.shape)):
+    if (np.any(pos1 < 0) or np.any(pos2 < 0) or
+            np.any(pos1 >= track.shape) or np.any(pos2 >= track.shape)):
         return False
     diff = pos2 - pos1
-    # Go through the straight line connecting ``pos1`` and ``pos2``
     if diff[0] != 0:
         slope = diff[1] / diff[0]
-        d = int(np.sign(diff[0]))  # direction: left or right
+        d = int(np.sign(diff[0]))  # direction in x
         for i in range(abs(diff[0]) + 1):
             x = int(pos1[0] + i * d)
             y = pos1[1] + i * slope * d
@@ -263,7 +254,7 @@ def valid_line(state: State, pos1: np.ndarray, pos2: np.ndarray) -> bool:
                 return False
     if diff[1] != 0:
         slope = diff[0] / diff[1]
-        d = int(np.sign(diff[1]))  # direction: up or down
+        d = int(np.sign(diff[1]))  # direction in y
         for i in range(abs(diff[1]) + 1):
             x = pos1[0] + i * slope * d
             y = int(pos1[1] + i * d)
@@ -281,13 +272,11 @@ def valid_line(state: State, pos1: np.ndarray, pos2: np.ndarray) -> bool:
 
 def build_traversable_mask(world_model: np.ndarray) -> np.ndarray:
     """
-    Returns a boolean mask (same shape as world_model) indicating which
-    cells are considered traversable for global A* planning.
+    Returns a boolean mask indicating which cells are traversable globally.
 
-    For global planning:
-      - WALL is blocked,
-      - NOT_VISIBLE is also blocked (nem akarunk rajta keresztül tervezni),
-        csak a határára (frontier) megyünk.
+    Globális tervezésben:
+      - WALL és NOT_VISIBLE = blokkolt,
+      - többi (EMPTY/START/OIL/SAND/GOAL) = járható, de OIL/SAND drágább lesz.
     """
     traversable_mask = np.ones_like(world_model, dtype=bool)
     blocked = (
@@ -301,16 +290,14 @@ def build_traversable_mask(world_model: np.ndarray) -> np.ndarray:
 def collect_goals(world_model: np.ndarray,
                   traversable_mask: np.ndarray) -> list[tuple[int, int]]:
     """
-    Collects goal cells for global A*.
+    Goal cellák gyűjtése globális A*-hoz.
 
-    1) Ha látjuk a GOAL cell(eke)t, akkor ezek a célok.
-    2) Különben 'frontier' cellák: ismert, járható cellák, amelyek
-       szomszédai között van NOT_VISIBLE vagy UNKNOWN – tehát
-       az ismeretlen határára tervezünk.
+    1) Ha van GOAL, azokat használjuk.
+    2) Különben frontier cellák (ismert, járható cella, ami UNKNOWN/NOT_VISIBLE
+       szomszéd mellett van) – így az ismeretlen határára megyünk.
     """
     h, w = world_model.shape
 
-    # Actual GOAL cells.
     goal_positions = np.argwhere(world_model == CellType.GOAL.value)
     if goal_positions.size > 0:
         return [tuple(p) for p in goal_positions]
@@ -346,13 +333,16 @@ def collect_goals(world_model: np.ndarray,
 
 def astar_any_goal(
     traversable_mask: np.ndarray,
+    world_model: np.ndarray,
     start: tuple[int, int],
     goals: list[tuple[int, int]],
 ) -> Optional[list[tuple[int, int]]]:
     """
     A* path planner on a grid with 8-connected neighbourhood.
 
-    Returns a path from start to the closest goal (inclusive), or None.
+    Új: terepköltségek
+      - EMPTY/START/GOAL: 1x
+      - OIL/SAND: 5x (nagy büntetés, de nem lehetetlen)
     """
     if not goals:
         return None
@@ -372,6 +362,16 @@ def astar_any_goal(
         diff = goals_arr - np.array([cx, cy], dtype=float)
         dists = np.sqrt((diff[:, 0] ** 2) + (diff[:, 1] ** 2))
         return float(dists.min())
+
+    def terrain_factor(x: int, y: int) -> float:
+        """
+        Terepköltség szorzó a (x,y) cellába lépéshez.
+        """
+        v = world_model[x, y]
+        if v in (CellType.OIL.value, CellType.SAND.value):
+            return 5.0
+        # minden más járható típus (EMPTY, START, GOAL, stb.)
+        return 1.0
 
     neighbours = [
         (-1, 0, 1.0), (1, 0, 1.0),
@@ -402,7 +402,7 @@ def astar_any_goal(
             return path
 
         cx, cy = current
-        for dx, dy, move_cost in neighbours:
+        for dx, dy, base_cost in neighbours:
             nx = cx + dx
             ny = cy + dy
             if nx < 0 or ny < 0 or nx >= h or ny >= w:
@@ -410,6 +410,7 @@ def astar_any_goal(
             if not traversable_mask[nx, ny]:
                 continue
 
+            move_cost = base_cost * terrain_factor(nx, ny)
             neighbour = (nx, ny)
             tentative_g = g_score[current] + move_cost
 
@@ -429,8 +430,10 @@ def plan_global_path(state: State) -> Optional[list[tuple[int, int]]]:
       - the GOAL (if known), or
       - the nearest frontier cell (boundary of unknown).
 
-    Also removes the current cell from the goal set (ha több cél van),
-    hogy ne álljon be egy sarokba célként.
+    Plusz:
+      - saját cellánkat kivesszük a goals-ból (ha van más is), hogy ne
+        álljunk be sarokba célként.
+      - OIL/SAND magas útköltségű, így az A* is kerüli.
     """
     assert state.agent is not None
     world_model = state.world_model.copy()
@@ -451,7 +454,7 @@ def plan_global_path(state: State) -> Optional[list[tuple[int, int]]]:
         if not goals:
             return None
 
-    return astar_any_goal(traversable_mask, start, goals)
+    return astar_any_goal(traversable_mask, world_model, start, goals)
 
 
 # ---------------------------------------------------------------------- #
@@ -463,14 +466,15 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
     Main decision function.
 
     - Globális A* a world_model alapján (cél: GOAL vagy frontier).
-    - A path mentén kiválasztunk egy előre néző waypointot.
+    - A path mentén kiválasztunk egy előre néző waypointot (lookahead).
     - Minden lehetséges accel (dx, dy) in {-1,0,1}^2 közül választunk:
         * new_vel = self_vel + accel
-        * new_vel NEM lehet (0,0)  <-- NEM ÁLLUNK MEG
+        * new_vel NEM lehet (0,0)  <-- sosem állunk meg
         * sebességkorlát (VEL_MAX),
         * valid_line + collision check,
-        * pontozás: célhoz való közelség, sebesség, előre haladás,
-                    visszafordulás büntetése.
+        * extra büntetés, ha OIL/SAND mezőre lépünk,
+        * kétlépcsős: ha van olyan lépés, ami nem megy visszafelé,
+          csak ezek közül választunk.
     """
     assert state.agent is not None, "Agent state not initialised."
     assert state.visible_track is not None, "visible_track not initialised."
@@ -495,8 +499,9 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
         """
         A move is valid if:
           * speed under VEL_MAX,
-          * line-of-sight free,
-          * no collision with other players.
+          * line-of-sight free of walls,
+          * no collision with other players,
+          * nem maradunk ugyanazon a cellán.
         """
         if np.linalg.norm(new_vel, ord=2) > VEL_MAX:
             return False
@@ -505,7 +510,6 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
             return False
 
         if np.all(next_pos == self_pos):
-            # Már eleve kizárjuk a new_vel == 0-t, de biztos ami biztos.
             return False
 
         for p in state.players:
@@ -528,15 +532,17 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
         else:
             forward_unit = np.array([0.0, 1.0])
 
-    best_moves: list[tuple[int, int]] = []
-    best_score = float("inf")
+    # Összes jelölt lépést eltároljuk, aztán kétlépcsős szűrés
+    candidates: list[dict] = []
+
+    h, w = state.world_model.shape
 
     for dx in range(-1, 2):
         for dy in range(-1, 2):
             accel = np.array([dx, dy], dtype=int)
             new_vel = self_vel + accel
 
-            # *** FONTOS: ne tudjunk megállni ***
+            # Nem állunk meg: tiltjuk a zéró sebességet
             if np.all(new_vel == 0):
                 continue
 
@@ -545,6 +551,7 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
             if not valid_move(next_pos, new_vel):
                 continue
 
+            # Távolság a path-waypointhoz
             if target_cell is not None:
                 dist_to_target = float(
                     np.linalg.norm(target_cell - next_pos.astype(float), ord=2)
@@ -554,6 +561,7 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
 
             speed = float(np.linalg.norm(new_vel, ord=2))
 
+            # Irány-illeszkedés
             if np.linalg.norm(new_vel, ord=2) > 1e-6:
                 vel_unit = new_vel.astype(float) / np.linalg.norm(
                     new_vel, ord=2
@@ -562,6 +570,7 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
             else:
                 forward_align = 0.0
 
+            # Visszafordulás büntetése
             backward_penalty = 0.0
             if LAST_POS is not None:
                 move_from_last = self_pos.astype(float) - LAST_POS.astype(float)
@@ -575,32 +584,61 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
                     )
                     cos_angle = float(np.dot(vel_unit2, dir_from_last))
                     if cos_angle < 0:
-                        backward_penalty = -cos_angle
+                        backward_penalty = -cos_angle  # 0..2 kb
 
+            # Terep büntetés (lokálisan is kerüljük az olajat/homokot)
+            terrain_penalty = 0.0
+            x, y = int(next_pos[0]), int(next_pos[1])
+            if 0 <= x < h and 0 <= y < w:
+                cell = state.world_model[x, y]
+                if cell in (CellType.OIL.value, CellType.SAND.value):
+                    terrain_penalty = 3.0  # elég nagy, de nem végtelen
+
+            # Alap score – még NEM vesszük figyelembe, hogy hátrafelé van-e,
+            # csak eltároljuk (később kétlépcsősen szűrünk).
             score = (
                 dist_to_target
                 + 0.2 * speed
                 - 0.5 * forward_align
                 + 0.8 * backward_penalty
+                + terrain_penalty
             )
 
-            if score < best_score - 1e-6:
-                best_score = score
-                best_moves = [(dx, dy)]
-            elif abs(score - best_score) <= 1e-6:
-                best_moves.append((dx, dy))
+            candidates.append(
+                {
+                    "dx": dx,
+                    "dy": dy,
+                    "score": score,
+                    "back": backward_penalty,
+                }
+            )
 
-    if best_moves:
-        chosen = tuple(rng.choice(best_moves))  # type: ignore[misc]
-        return chosen
+    if not candidates:
+        print(
+            "No valid move except maybe standing still – trapped?",
+            file=sys.stderr,
+        )
+        return (0, 0)
 
-    # Ha tényleg nincs egyetlen érvényes mozdulat sem (teljesen befalazva),
-    # akkor muszáj nullázni – de ez nagyon ritka kell legyen.
-    print(
-        "No valid move except standing still – trapped?",
-        file=sys.stderr,
-    )
-    return (0, 0)
+    # Első lépés: próbáljunk olyan lépést választani, ami NEM megy hátra.
+    non_back = [c for c in candidates if c["back"] < 1e-6]
+    if non_back:
+        pool = non_back
+    else:
+        # Ha MINDEN lépés hátra megy, akkor kénytelenek vagyunk valamelyiket
+        # választani – zsákutcából vissza kell fordulni.
+        pool = candidates
+
+    # Második lépés: a kiválasztott pool-ból minimális score alapján döntünk.
+    best_score = min(c["score"] for c in pool)
+    best_moves = [
+        (c["dx"], c["dy"])
+        for c in pool
+        if abs(c["score"] - best_score) <= 1e-6
+    ]
+
+    chosen = tuple(rng.choice(best_moves))  # type: ignore[misc]
+    return chosen
 
 
 def main():
