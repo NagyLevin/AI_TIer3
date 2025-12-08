@@ -298,7 +298,8 @@ def count_unknown_in_radius(track: np.ndarray,
 
 def find_path_to_nearest_target(track: np.ndarray,
                                 start: np.ndarray,
-                                target_cells: list[tuple[int, int]]
+                                target_cells: list[tuple[int, int]],
+                                bias: Optional[np.ndarray] = None
                                 ) -> Optional[list[tuple[int, int]]]:
     """
     Generic BFS path finder on the currently known track.
@@ -311,14 +312,20 @@ def find_path_to_nearest_target(track: np.ndarray,
         Starting cell coordinates [x, y].
     target_cells : list[(int, int)]
         List of target cells to which we would like to find a path.
+    bias : np.ndarray or None
+        Optional "direction preference". If provided, the BFS will expand
+        neighbours in the direction of 'bias' first, so we tend to find
+        targets on that side of the map sooner (but still with a valid BFS
+        shortest path for the chosen target).
 
     Returns
     -------
     path : list[(int, int)] or None
-        The shortest path (in number of steps) from start to the nearest
-        target cell, including both start and target. Uses 4-neighbour
-        moves and also checks the line-of-sight constraint between
-        neighbouring cells, so the path is compatible with the physics.
+        A path (in number of steps shortest to the chosen target) from
+        start to the first reached target cell, including both start and
+        target. Uses 4-neighbour moves and also checks the line-of-sight
+        constraint between neighbouring cells, so the path is compatible
+        with the physics.
     """
     if not target_cells:
         return None
@@ -335,7 +342,7 @@ def find_path_to_nearest_target(track: np.ndarray,
     visited = {start_cell}
     parent: dict[tuple[int, int], tuple[int, int]] = {}
 
-    directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    base_directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
     while q:
         cx, cy = q.popleft()
@@ -348,6 +355,20 @@ def find_path_to_nearest_target(track: np.ndarray,
             path.reverse()
             return path
 
+        # Possibly reorder directions based on bias (goal hint).
+        if bias is not None:
+            gx, gy = int(bias[0]), int(bias[1])
+            vecx, vecy = gx - cx, gy - cy
+
+            def dir_score(d):
+                dx, dy = d
+                # Prefer directions with larger dot product with vector to bias
+                return dx * vecx + dy * vecy
+
+            directions = sorted(base_directions, key=dir_score, reverse=True)
+        else:
+            directions = base_directions
+
         for dx, dy in directions:
             nx, ny = cx + dx, cy + dy
             if not (0 <= nx < H and 0 <= ny < W):
@@ -357,7 +378,6 @@ def find_path_to_nearest_target(track: np.ndarray,
                 continue
             if not traversable(track[nx, ny]):
                 continue
-            # Check that the line between the two cell centres is clear.
             if not is_line_clear(track,
                                  np.array([cx, cy], dtype=int),
                                  np.array([nx, ny], dtype=int)):
@@ -381,7 +401,9 @@ def find_path_to_nearest_goal(track: np.ndarray,
     if goal_positions.size == 0:
         return None
     target_cells = [(int(x), int(y)) for x, y in goal_positions]
-    return find_path_to_nearest_target(track, start, target_cells)
+    # For the actual goal path we do NOT bias BFS, we want the
+    # shortest path on the known map.
+    return find_path_to_nearest_target(track, start, target_cells, bias=None)
 
 
 def compute_frontier_cells(track: np.ndarray,
@@ -477,7 +499,8 @@ def choose_accel_toward_cell(state: State,
 
 def choose_exploration_move(state: State,
                             visit_counts: np.ndarray,
-                            rng: np.random.Generator
+                            rng: np.random.Generator,
+                            goal_hint: Optional[np.ndarray] = None
                             ) -> tuple[int, int]:
     """
     Low-level "local" exploration step.
@@ -487,7 +510,9 @@ def choose_exploration_move(state: State,
       - count how many NOT_VISIBLE cells would be inside our visibility
         radius from that position,
       - subtract a small penalty for visiting cells many times,
-      - enforce the SPEED_LIMIT.
+      - enforce the SPEED_LIMIT,
+      - if a goal hint is known, we add a small preference to moves
+        that keep us closer to the goal region.
 
     Among all valid accelerations we choose the one with highest score.
     """
@@ -529,6 +554,12 @@ def choose_exploration_move(state: State,
             # revisiting the same place over and over.
             score = unknown_count * 100.0 - visited_penalty - 0.5 * speed
 
+            # If we already know (or suspect) where the goal is, prefer moves
+            # that keep us closer to the goal region.
+            if goal_hint is not None:
+                goal_dist = np.linalg.norm(goal_hint - new_pos)
+                score -= 0.5 * goal_dist
+
             if score > best_score:
                 best_score = score
                 best_moves = [(ax, ay)]
@@ -556,15 +587,18 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
       2. Try to find a *valid path* on the known map to a GOAL cell (value 100)
          using BFS and the same line-of-sight constraint as the server.
          If such a path exists, we follow it with a path-following controller.
-         (Tehát csak akkor megyünk be a célba, ha van oda érvényes útvonal.)
       3. If there is no known valid path to any goal:
-         a) Build the list of frontier cells (traversable cells from which
+         a) If we have seen the goal somewhere, bias exploration and frontier
+            choice towards that side of the map (frontiers "closer" to the
+            goal are preferred), so we don't waste time exploring the opposite
+            side first.
+         b) Build the list of frontier cells (traversable cells from which
             we can still see some NOT_VISIBLE tiles).
-         b) If frontiers exist, BFS to the nearest one and move along that
-            path. When we are already on a frontier, use a local exploration
-            heuristic to open up as much new territory as possible.
-            (Ezzel próbáljuk minél teljesebben bejárni a HxW pályát.)
-         c) If there are no frontier cells either, the reachable part of
+         c) If frontiers exist, BFS to the nearest (biased) one and move along
+            that path. When we are already on a frontier, use a local
+            exploration heuristic to open up as much new territory as
+            possible.
+         d) If there are no frontier cells either, the reachable part of
             the map is fully explored. In that case, we simply try to slow
             down and stay safe.
     """
@@ -582,6 +616,14 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
 
     # Mark current cell as visited
     VISIT_COUNTS[pos[0], pos[1]] += 1
+
+    # Discover all known goal cells (100)
+    goal_positions = np.argwhere(track == 100)
+    goal_hint: Optional[np.ndarray] = None
+    if goal_positions.size > 0:
+        # Use the closest known goal as direction hint
+        dists = [np.linalg.norm(pos - g.astype(int)) for g in goal_positions]
+        goal_hint = goal_positions[int(np.argmin(dists))].astype(int)
 
     # --- 1) Try to go to a known, reachable GOAL --------------------------- #
     path_to_goal = find_path_to_nearest_goal(track, pos)
@@ -616,8 +658,11 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
 
         if not current_is_frontier:
             # We are not on a frontier yet -> go to the nearest frontier cell.
+            # If we have a goal_hint (we have seen the goal but not yet have
+            # a valid path), BFS will be biased towards frontiers that are
+            # on the same side of the map as the goal.
             path_to_frontier = find_path_to_nearest_target(
-                track, pos, frontier_cells
+                track, pos, frontier_cells, bias=goal_hint
             )
             if path_to_frontier is not None and len(path_to_frontier) > 1:
                 next_waypoint = np.array(path_to_frontier[1], dtype=int)
@@ -631,8 +676,10 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
                     return accel
                 # If we cannot find a valid acceleration towards the
                 # waypoint, we fall back to local exploration.
+
         # Either we are already on a frontier, or pathfinding failed.
-        return choose_exploration_move(state, VISIT_COUNTS, rng)
+        # Local exploration is optionally biased towards the goal.
+        return choose_exploration_move(state, VISIT_COUNTS, rng, goal_hint)
 
     # --- 3) Fully explored & no reachable goal ----------------------------- #
     # No unknown cells in the neighbourhood of any traversable tile:
@@ -651,7 +698,7 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
 
     # If decelerating directly is not possible, fall back to local exploration
     # which still respects walls and SPEED_LIMIT.
-    return choose_exploration_move(state, VISIT_COUNTS, rng)
+    return choose_exploration_move(state, VISIT_COUNTS, rng, goal_hint)
 
 
 def main():
