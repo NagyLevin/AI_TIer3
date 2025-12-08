@@ -1,6 +1,7 @@
 import sys
 import os
 import enum
+import heapq
 import numpy as np
 
 from typing import Optional, NamedTuple
@@ -13,7 +14,8 @@ class CellType(enum.Enum):
         0:  empty cell
        -1:  wall cell (everything outside the map is also wall)
         1:  start cell
-        3:  cell is not visible (fog of war)
+        2:  unknown (currently unused, reserved)
+        3:  cell is not visible (fog of war, used in world_model)
        91:  oil cell
        92:  sand cell
       100: goal cell
@@ -42,10 +44,16 @@ class Player(NamedTuple):
 
     @property
     def pos(self) -> np.ndarray:
+        """
+        Returns the current position as a NumPy integer array [x, y].
+        """
         return np.array([self.x, self.y], dtype=int)
 
     @property
     def vel(self) -> np.ndarray:
+        """
+        Returns the current velocity as a NumPy integer array [vel_x, vel_y].
+        """
         return np.array([self.vel_x, self.vel_y], dtype=int)
 
 
@@ -67,7 +75,7 @@ class State(NamedTuple):
     Full internal state of our agent.
 
     circuit       : static circuit info
-    visible_track : "safe" map used for planning (unknown treated as wall)
+    visible_track : map used for planning (most up-to-date world_model)
     players       : list of all players' (last known) positions
     agent         : our own Player object
     world_model   : persistent world model built from all observations so far
@@ -78,6 +86,13 @@ class State(NamedTuple):
     players: list[Player]
     agent: Optional[Player]
     world_model: np.ndarray
+
+
+# ---------------------------------------------------------------------- #
+# Globals: last position/velocity – to penalise turning back
+# ---------------------------------------------------------------------- #
+LAST_POS: Optional[np.ndarray] = None
+LAST_VEL: Optional[np.ndarray] = None
 
 
 def read_initial_observation() -> Circuit:
@@ -102,14 +117,19 @@ def _update_world_model(
       * reads the local visibility square from stdin,
       * updates the persistent world_model with everything that is actually
         visible (cells with value != CellType.NOT_VISIBLE),
-      * builds a "planning" map (visible_track) where every unknown cell
-        is treated as a wall for safety.
+      * builds a "planning" map (visible_track) as a copy of the updated
+        world_model.
 
-    Returns (visible_track, updated_world_model).
+    IMPORTANT CHANGE:
+      - visible_track most már NEM tölti ki a teljes pályát WALL-lal.
+        Ehelyett a world_model aktuális állapotát használjuk, így az
+        ismeretlen cellák (NOT_VISIBLE) nem blokkolják a mozgást.
     """
     height, width = track_shape
-    # start with every unseen cell considered as a wall for planning
-    visible_track = np.full(track_shape, CellType.WALL.value, dtype=int)
+
+    # Start from the previous world model for visible_track;
+    # we will update both when we actually see cells.
+    visible_track = world_model.copy()
 
     for i in range(2 * visibility_radius + 1):
         # One line of the local map centred on the agent
@@ -135,14 +155,8 @@ def _update_world_model(
             y = y_start + offset
 
             # Update persistent world model if the cell is actually visible.
-            # NOT_VISIBLE just means "not seen now", it should not overwrite
-            # older knowledge.
             if cell_val != CellType.NOT_VISIBLE.value:
                 world_model[x, y] = cell_val
-
-            # For planning we only trust cells that we truly see; everything
-            # else remains a WALL in visible_track.
-            if cell_val != CellType.NOT_VISIBLE.value:
                 visible_track[x, y] = cell_val
 
     return visible_track, world_model
@@ -201,18 +215,7 @@ def read_observation(old_state: State) -> Optional[State]:
 def save_world_model(world_model: np.ndarray, fname: str = "logs/agentmap.txt") -> None:
     """
     Saves the current world model into a text file so that it looks similar
-    to the task description:
-
-        0   : empty cell
-        -1  : wall
-        1   : start
-        3   : not (yet) visible
-        91  : oil
-        92  : sand
-        100 : goal
-
-    The file will contain one row per line, with space separated integers.
-    The directory 'logs' is created if it does not exist.
+    to the task description.
     """
     os.makedirs(os.path.dirname(fname), exist_ok=True)
     with open(fname, "w", encoding="utf-8") as f:
@@ -224,9 +227,13 @@ def save_world_model(world_model: np.ndarray, fname: str = "logs/agentmap.txt") 
 def traversable(cell_value: int) -> bool:
     """
     Returns True if the given cell value is considered traversable
-    for path-checking purposes.
+    for path-checking purposes in the local planning map.
+
+    IMPORTANT CHANGE:
+      - Az ismeretlen cellákat (NOT_VISIBLE, UNKNOWN) most már
+        járhatónak tekintjük. Csak a tényleges WALL blokkol.
     """
-    return cell_value >= 0
+    return cell_value != CellType.WALL.value
 
 
 def valid_line(state: State, pos1: np.ndarray, pos2: np.ndarray) -> bool:
@@ -234,8 +241,7 @@ def valid_line(state: State, pos1: np.ndarray, pos2: np.ndarray) -> bool:
     Checks whether the straight line from pos1 to pos2 is free from walls
     on the current planning map (state.visible_track).
 
-    This is a reimplementation of the judge's line-of-sight logic, using
-    our own (possibly incomplete) knowledge of the world.
+    This uses our updated traversable() where unknown cells are traversable.
     """
     assert state.visible_track is not None, "visible_track not initialised yet."
     track = state.visible_track
@@ -244,9 +250,6 @@ def valid_line(state: State, pos1: np.ndarray, pos2: np.ndarray) -> bool:
         return False
     diff = pos2 - pos1
     # Go through the straight line connecting ``pos1`` and ``pos2``
-    # cell-by-cell. Wall is blocking if either it is straight in the way or
-    # there are two wall cells above/below each other and the line would go
-    # "through" them.
     if diff[0] != 0:
         slope = diff[1] / diff[0]
         d = int(np.sign(diff[0]))  # direction: left or right
@@ -258,8 +261,6 @@ def valid_line(state: State, pos1: np.ndarray, pos2: np.ndarray) -> bool:
             if (not traversable(track[x, y_ceil])
                     and not traversable(track[x, y_floor])):
                 return False
-    # Do the same, but examine two-cell-wall configurations when they are
-    # side-by-side (east-west).
     if diff[1] != 0:
         slope = diff[0] / diff[1]
         d = int(np.sign(diff[1]))  # direction: up or down
@@ -274,86 +275,329 @@ def valid_line(state: State, pos1: np.ndarray, pos2: np.ndarray) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------- #
+# A* PATH PLANNING HELPERS
+# ---------------------------------------------------------------------- #
+
+def build_traversable_mask(world_model: np.ndarray) -> np.ndarray:
+    """
+    Returns a boolean mask (same shape as world_model) indicating which
+    cells are considered traversable for global A* planning.
+
+    For global planning:
+      - WALL is blocked,
+      - NOT_VISIBLE is also blocked (nem akarunk rajta keresztül tervezni),
+        csak a határára (frontier) megyünk.
+    """
+    traversable_mask = np.ones_like(world_model, dtype=bool)
+    blocked = (
+        (world_model == CellType.WALL.value) |
+        (world_model == CellType.NOT_VISIBLE.value)
+    )
+    traversable_mask[blocked] = False
+    return traversable_mask
+
+
+def collect_goals(world_model: np.ndarray,
+                  traversable_mask: np.ndarray) -> list[tuple[int, int]]:
+    """
+    Collects goal cells for global A*.
+
+    1) Ha látjuk a GOAL cell(eke)t, akkor ezek a célok.
+    2) Különben 'frontier' cellák: ismert, járható cellák, amelyek
+       szomszédai között van NOT_VISIBLE vagy UNKNOWN – tehát
+       az ismeretlen határára tervezünk.
+    """
+    h, w = world_model.shape
+
+    # Actual GOAL cells.
+    goal_positions = np.argwhere(world_model == CellType.GOAL.value)
+    if goal_positions.size > 0:
+        return [tuple(p) for p in goal_positions]
+
+    frontier: list[tuple[int, int]] = []
+    directions = [
+        (-1, 0), (1, 0), (0, -1), (0, 1),
+        (-1, -1), (-1, 1), (1, -1), (1, 1)
+    ]
+
+    for x in range(h):
+        for y in range(w):
+            if not traversable_mask[x, y]:
+                continue
+            cell = world_model[x, y]
+            if cell in (CellType.EMPTY.value,
+                        CellType.START.value,
+                        CellType.OIL.value,
+                        CellType.SAND.value):
+                for dx, dy in directions:
+                    nx = x + dx
+                    ny = y + dy
+                    if nx < 0 or ny < 0 or nx >= h or ny >= w:
+                        continue
+                    ncell = world_model[nx, ny]
+                    if ncell in (CellType.NOT_VISIBLE.value,
+                                 CellType.UNKNOWN.value):
+                        frontier.append((x, y))
+                        break
+
+    return frontier
+
+
+def astar_any_goal(
+    traversable_mask: np.ndarray,
+    start: tuple[int, int],
+    goals: list[tuple[int, int]],
+) -> Optional[list[tuple[int, int]]]:
+    """
+    A* path planner on a grid with 8-connected neighbourhood.
+
+    Returns a path from start to the closest goal (inclusive), or None.
+    """
+    if not goals:
+        return None
+
+    h, w = traversable_mask.shape
+    if (start[0] < 0 or start[1] < 0 or
+            start[0] >= h or start[1] >= w):
+        return None
+    if not traversable_mask[start]:
+        return None
+
+    goal_set = set(goals)
+    goals_arr = np.array(goals, dtype=float)
+
+    def heuristic(cell: tuple[int, int]) -> float:
+        cx, cy = cell
+        diff = goals_arr - np.array([cx, cy], dtype=float)
+        dists = np.sqrt((diff[:, 0] ** 2) + (diff[:, 1] ** 2))
+        return float(dists.min())
+
+    neighbours = [
+        (-1, 0, 1.0), (1, 0, 1.0),
+        (0, -1, 1.0), (0, 1, 1.0),
+        (-1, -1, np.sqrt(2)), (-1, 1, np.sqrt(2)),
+        (1, -1, np.sqrt(2)), (1, 1, np.sqrt(2))
+    ]
+
+    open_heap: list[tuple[float, tuple[int, int]]] = []
+    heapq.heappush(open_heap, (heuristic(start), start))
+
+    g_score: dict[tuple[int, int], float] = {start: 0.0}
+    parent: dict[tuple[int, int], tuple[int, int]] = {}
+    closed: set[tuple[int, int]] = set()
+
+    while open_heap:
+        f, current = heapq.heappop(open_heap)
+        if current in closed:
+            continue
+        closed.add(current)
+
+        if current in goal_set:
+            path = [current]
+            while current in parent:
+                current = parent[current]
+                path.append(current)
+            path.reverse()
+            return path
+
+        cx, cy = current
+        for dx, dy, move_cost in neighbours:
+            nx = cx + dx
+            ny = cy + dy
+            if nx < 0 or ny < 0 or nx >= h or ny >= w:
+                continue
+            if not traversable_mask[nx, ny]:
+                continue
+
+            neighbour = (nx, ny)
+            tentative_g = g_score[current] + move_cost
+
+            old_g = g_score.get(neighbour, float("inf"))
+            if tentative_g < old_g:
+                g_score[neighbour] = tentative_g
+                parent[neighbour] = current
+                f_score = tentative_g + heuristic(neighbour)
+                heapq.heappush(open_heap, (f_score, neighbour))
+
+    return None
+
+
+def plan_global_path(state: State) -> Optional[list[tuple[int, int]]]:
+    """
+    Builds a global A* path from the agent to:
+      - the GOAL (if known), or
+      - the nearest frontier cell (boundary of unknown).
+
+    Also removes the current cell from the goal set (ha több cél van),
+    hogy ne álljon be egy sarokba célként.
+    """
+    assert state.agent is not None
+    world_model = state.world_model.copy()
+    traversable_mask = build_traversable_mask(world_model)
+
+    h, w = world_model.shape
+    for p in state.players:
+        if 0 <= p.x < h and 0 <= p.y < w:
+            traversable_mask[p.x, p.y] = False
+
+    start = tuple(state.agent.pos.tolist())
+    goals = collect_goals(world_model, traversable_mask)
+    if not goals:
+        return None
+
+    if len(goals) > 1:
+        goals = [g for g in goals if g != start]
+        if not goals:
+            return None
+
+    return astar_any_goal(traversable_mask, start, goals)
+
+
+# ---------------------------------------------------------------------- #
+# MAIN DECISION FUNCTION
+# ---------------------------------------------------------------------- #
+
 def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
     """
-    Main decision function of the agent.
+    Main decision function.
 
-    New behaviour:
-      * the agent builds a persistent world model from all previous turns,
-      * among all valid accelerations in {-1,0,1}^2 it chooses the one
-        whose resulting position is closest to any known wall cell,
-        effectively "following" the nearest wall.
-
-    The function returns (dx, dy) which is the acceleration vector the
-    environment expects.
+    - Globális A* a world_model alapján (cél: GOAL vagy frontier).
+    - A path mentén kiválasztunk egy előre néző waypointot.
+    - Minden lehetséges accel (dx, dy) in {-1,0,1}^2 közül választunk:
+        * new_vel = self_vel + accel
+        * new_vel NEM lehet (0,0)  <-- NEM ÁLLUNK MEG
+        * sebességkorlát (VEL_MAX),
+        * valid_line + collision check,
+        * pontozás: célhoz való közelség, sebesség, előre haladás,
+                    visszafordulás büntetése.
     """
     assert state.agent is not None, "Agent state not initialised."
+    assert state.visible_track is not None, "visible_track not initialised."
+
+    global LAST_POS, LAST_VEL
+
     self_pos = state.agent.pos
     self_vel = state.agent.vel
 
-    # Precompute locations of all known wall cells in the world model
-    wall_cells = np.argwhere(state.world_model == CellType.WALL.value)
+    VEL_MAX = 4.0
 
-    def distance_to_wall(pos: np.ndarray) -> float:
-        """
-        Returns the Euclidean distance from `pos` to the closest known wall.
-        If we don't know any wall yet, returns a very large number so that
-        every move is equally "bad" in this sense.
-        """
-        if wall_cells.size == 0:
-            return 1e9
-        # wall_cells has shape (N, 2); broadcasting pos over the first axis
-        diffs = wall_cells - pos
-        dists = np.linalg.norm(diffs, axis=1)
-        return float(dists.min())
+    path = plan_global_path(state)
 
-    def valid_move(next_pos: np.ndarray) -> bool:
+    # Choose lookahead waypoint
+    if path is not None and len(path) >= 2:
+        lookahead_index = min(len(path) - 1, 4)
+        target_cell = np.array(path[lookahead_index], dtype=float)
+    else:
+        target_cell = None
+
+    def valid_move(next_pos: np.ndarray, new_vel: np.ndarray) -> bool:
         """
-        A move is valid if the straight line is free and we don't collide with
-        other players (based on their last known positions).
+        A move is valid if:
+          * speed under VEL_MAX,
+          * line-of-sight free,
+          * no collision with other players.
         """
+        if np.linalg.norm(new_vel, ord=2) > VEL_MAX:
+            return False
+
         if not valid_line(state, self_pos, next_pos):
             return False
-        # staying in place is always allowed from the collision point of view
+
         if np.all(next_pos == self_pos):
-            return True
-        # avoid stepping onto another player's cell
+            # Már eleve kizárjuk a new_vel == 0-t, de biztos ami biztos.
+            return False
+
         for p in state.players:
             if np.all(next_pos == p.pos):
                 return False
         return True
 
-    # Desired centre if we keep the current velocity
-    new_center = self_pos + self_vel
+    # Forward direction
+    if target_cell is not None:
+        forward_vec = target_cell - self_pos.astype(float)
+        if np.linalg.norm(forward_vec, ord=2) > 1e-6:
+            forward_unit = forward_vec / np.linalg.norm(forward_vec, ord=2)
+        else:
+            forward_unit = np.zeros(2, dtype=float)
+    else:
+        if np.linalg.norm(self_vel, ord=2) > 1e-6:
+            forward_unit = self_vel.astype(float) / np.linalg.norm(
+                self_vel, ord=2
+            )
+        else:
+            forward_unit = np.array([0.0, 1.0])
 
     best_moves: list[tuple[int, int]] = []
-    best_dist = float("inf")
+    best_score = float("inf")
 
-    # We consider every possible acceleration in {-1, 0, 1}^2
     for dx in range(-1, 2):
         for dy in range(-1, 2):
-            # Target position after applying this acceleration
-            target = new_center + np.array([dx, dy], dtype=int)
+            accel = np.array([dx, dy], dtype=int)
+            new_vel = self_vel + accel
 
-            if not valid_move(target):
+            # *** FONTOS: ne tudjunk megállni ***
+            if np.all(new_vel == 0):
                 continue
 
-            dist = distance_to_wall(target)
+            next_pos = self_pos + new_vel
 
-            # We want to be as close as possible to some wall (but not inside it)
-            if dist < best_dist - 1e-6:
-                best_dist = dist
+            if not valid_move(next_pos, new_vel):
+                continue
+
+            if target_cell is not None:
+                dist_to_target = float(
+                    np.linalg.norm(target_cell - next_pos.astype(float), ord=2)
+                )
+            else:
+                dist_to_target = 0.0
+
+            speed = float(np.linalg.norm(new_vel, ord=2))
+
+            if np.linalg.norm(new_vel, ord=2) > 1e-6:
+                vel_unit = new_vel.astype(float) / np.linalg.norm(
+                    new_vel, ord=2
+                )
+                forward_align = float(np.dot(vel_unit, forward_unit))
+            else:
+                forward_align = 0.0
+
+            backward_penalty = 0.0
+            if LAST_POS is not None:
+                move_from_last = self_pos.astype(float) - LAST_POS.astype(float)
+                if (np.linalg.norm(move_from_last, ord=2) > 1e-6 and
+                        np.linalg.norm(new_vel, ord=2) > 1e-6):
+                    dir_from_last = move_from_last / np.linalg.norm(
+                        move_from_last, ord=2
+                    )
+                    vel_unit2 = new_vel.astype(float) / np.linalg.norm(
+                        new_vel, ord=2
+                    )
+                    cos_angle = float(np.dot(vel_unit2, dir_from_last))
+                    if cos_angle < 0:
+                        backward_penalty = -cos_angle
+
+            score = (
+                dist_to_target
+                + 0.2 * speed
+                - 0.5 * forward_align
+                + 0.8 * backward_penalty
+            )
+
+            if score < best_score - 1e-6:
+                best_score = score
                 best_moves = [(dx, dy)]
-            elif abs(dist - best_dist) <= 1e-6:
+            elif abs(score - best_score) <= 1e-6:
                 best_moves.append((dx, dy))
 
     if best_moves:
-        # Break ties randomly so behaviour is not completely deterministic
-        return tuple(rng.choice(best_moves))  # type: ignore[misc]
+        chosen = tuple(rng.choice(best_moves))  # type: ignore[misc]
+        return chosen
 
-    # Fallback: if for some reason no move is valid, stay in place and complain
+    # Ha tényleg nincs egyetlen érvényes mozdulat sem (teljesen befalazva),
+    # akkor muszáj nullázni – de ez nagyon ritka kell legyen.
     print(
-        "Not blind, just being brave! (No valid wall-following action found.)",
+        "No valid move except standing still – trapped?",
         file=sys.stderr,
     )
     return (0, 0)
@@ -362,32 +606,30 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
 def main():
     """
     Entry point of the agent program.
-
-    It:
-      * prints 'READY' so that the judge knows we have initialised,
-      * reads the static circuit information,
-      * initialises an empty world model,
-      * then repeatedly:
-          - reads observations,
-          - updates the world model,
-          - chooses an action using calculate_move,
-          - prints the chosen (dx, dy) to stdout.
     """
+    global LAST_POS, LAST_VEL
+
     print("READY", flush=True)
     circuit = read_initial_observation()
-    # Initialise our persistent world model with "not visible" everywhere
     world_model = np.full(
         circuit.track_shape, CellType.NOT_VISIBLE.value, dtype=int
     )
     state: Optional[State] = State(circuit, None, [], None, world_model)
     rng = np.random.default_rng(seed=1)
 
+    prev_state: Optional[State] = None
+
     while True:
         assert state is not None
+        prev_state = state
         state = read_observation(state)
         if state is None:
-            # Game over
             return
+
+        if prev_state is not None and prev_state.agent is not None:
+            LAST_POS = prev_state.agent.pos.copy()
+            LAST_VEL = prev_state.agent.vel.copy()
+
         delta = calculate_move(rng, state)
         print(f"{delta[0]} {delta[1]}", flush=True)
 
