@@ -18,6 +18,8 @@ class CellType(enum.Enum):
     UNKNOWN = 2
     EMPTY = 0
     NOT_VISIBLE = 3
+    OIL = 91      # olaj (spec leírás szerint)
+    SAND = 92     # homok
 
 class Player(NamedTuple):
     x: int
@@ -42,6 +44,10 @@ class State(NamedTuple):
     visible_raw: Optional[np.ndarray]      # raw window with NOT_VISIBLE intact
     players: List[Player]
     agent: Optional[Player]
+
+# Hazard típus-azonosítók (homok/olaj) – könnyen átírható, ha a spec más
+SAND_TILES = {CellType.SAND.value}  # {92}
+OIL_TILES  = {CellType.OIL.value}   # {91}
 
 # ────────────────────────────────────────────────────────────────────────────────
 # I/O helpers
@@ -167,12 +173,21 @@ def find_reachable_zero(state: State, world: 'WorldModel', start_pos: np.ndarray
 # World model + hazard tracking
 # ────────────────────────────────────────────────────────────────────────────────
 
+def is_sand_val(v: int) -> bool:
+    return v in SAND_TILES
+
+def is_oil_val(v: int) -> bool:
+    return v in OIL_TILES
+
 def is_traversable_val(v: int) -> bool:
-    # UNKNOWN-ból nem tervezünk utat, csak amit már láttunk (>=0, nem UNKNOWN)
+    # UNKNOWN-ból nem tervezünk utat; minden más >=0 mehet (hazard is),
+    # de a BFS-ben opcionálisan kiszűrjük a hazardot.
     return (v >= 0) and (v != CellType.UNKNOWN.value)
 
-# minden nem klasszikus pozitív tile hazard/new
+# minden nem klasszikus pozitív tile (pl. homok/olaj) hazard/new
 def is_hazard_val(v: int) -> bool:
+    if is_sand_val(v) or is_oil_val(v):
+        return True
     if v < 0:
         return False
     if v in (
@@ -215,13 +230,25 @@ class WorldModel:
     def traversable(self, x: int, y: int) -> bool:
         H, W = self.shape
         if not (0 <= x < H and 0 <= y < W): return False
-        return is_traversable_val(self.known_map[x, y])
+        return is_traversable_val(int(self.known_map[x, y]))
 
     def is_hazard(self, x: int, y: int) -> bool:
         H, W = self.shape
         if not (0 <= x < H and 0 <= y < W):
             return False
         return int(self.hazard_val[x, y]) != -1
+
+    def is_sand(self, x: int, y: int) -> bool:
+        H, W = self.shape
+        if not (0 <= x < H and 0 <= y < W):
+            return False
+        return is_sand_val(int(self.known_map[x, y]))
+
+    def is_oil(self, x: int, y: int) -> bool:
+        H, W = self.shape
+        if not (0 <= x < H and 0 <= y < W):
+            return False
+        return is_oil_val(int(self.known_map[x, y]))
 
     def get_hazard_value(self, x: int, y: int) -> Optional[int]:
         H, W = self.shape
@@ -259,12 +286,17 @@ def back_of(d: Tuple[int,int]) -> Tuple[int,int]:
 
 class LeftWallPolicy:
     """
-    GOAL-prioritásos, frontier-alapú explorer (a név csak kompatibilitásból maradt).
+    GOAL-prioritásos, frontier-alapú explorer (a név csak kompatibilitás miatt maradt).
 
     Prioritási sorrend:
-    0) Ha van ismert, elérhető GOAL (100-as cella), arra megyünk (legrövidebb út BFS-sel).
-    1) Ha nincs GOAL, akkor BFS-sel frontier-t keresünk (ismeretlen szomszéddal rendelkező cella).
-    2) Ha frontier sincs, akkor lokálisan a legkevésbé látogatott, nem-hazard szomszéd felé megyünk.
+      0) Ha van ismert, elérhető GOAL (100-as cella), arra megyünk.
+         Először csak biztonságos (nem-hazard) úton próbálunk – ha NINCS ilyen út,
+         akkor engedjük a homok/olaj (hazard) mezőkön át is a BFS-t.
+      1) Ha nincs GOAL, akkor hasonló logikával frontier-t keresünk (ismeretlen
+         szomszéddal rendelkező cella): először hazard kerülés, aztán ha muszáj,
+         homok/olajon át is.
+      2) Ha frontier sincs, akkor lokálisan a legkevésbé látogatott, nem-hazard
+         szomszéd felé megyünk.
     """
     def __init__(self, world: WorldModel) -> None:
         self.world = world
@@ -301,12 +333,8 @@ class LeftWallPolicy:
         else:
             self.heading = (0, int(np.sign(vy)))
 
-    # 0) GOAL-BFS
-    def _find_goal_step(self, start: Tuple[int,int]) -> Optional[Tuple[Tuple[int,int], str]]:
-        """
-        BFS az ismert pályán, hogy elérjük a legközelebbi GOAL (100) cellát.
-        Ha találunk utat, az első rácslépést (start -> next_step) adjuk vissza.
-        """
+    # 0) GOAL-BFS – két fázis: először hazard nélkül, majd hazarddal
+    def _bfs_to_goal(self, start: Tuple[int,int], allow_hazard: bool) -> Optional[Tuple[Tuple[int,int], str]]:
         H, W = self.world.shape
         sx, sy = start
 
@@ -324,12 +352,18 @@ class LeftWallPolicy:
             for dx, dy in DIRS_4:
                 nx, ny = x + dx, y + dy
                 if 0 <= nx < H and 0 <= ny < W:
-                    if (nx, ny) not in prev and self.world.traversable(nx, ny):
-                        prev[(nx, ny)] = (x, y)
-                        q.append((nx, ny))
+                    if (nx, ny) in prev:
+                        continue
+                    tile_val = int(self.world.known_map[nx, ny])
+                    if not is_traversable_val(tile_val):
+                        continue
+                    if (not allow_hazard) and is_hazard_val(tile_val):
+                        continue
+                    prev[(nx, ny)] = (x, y)
+                    q.append((nx, ny))
 
         if goal is None:
-            return None  # még nem látjuk / nem érjük el a célt
+            return None
 
         # Útvonal visszafejtése: goal -> ... -> start
         path: List[Tuple[int,int]] = []
@@ -340,13 +374,24 @@ class LeftWallPolicy:
         path.reverse()  # [start, ..., goal]
 
         if len(path) == 1:
-            # már a célon állunk
             return (path[0], "on_goal")
 
         next_step = path[1]
-        return next_step, "go_goal"
+        # ha a path-ban van hazard, jelöljük a módot ennek megfelelően
+        mode = "go_goal"
+        if allow_hazard and any(is_hazard_val(int(self.world.known_map[x, y])) for (x, y) in path[1:]):
+            mode = "go_goal_through_hazard"
+        return next_step, mode
 
-    # 1) FRONTIER-LOGIKA
+    def _find_goal_step(self, start: Tuple[int,int]) -> Optional[Tuple[Tuple[int,int], str]]:
+        # 1) próbáljuk meg hazard NÉLKÜL
+        res = self._bfs_to_goal(start, allow_hazard=False)
+        if res is not None:
+            return res
+        # 2) ha nincs ilyen út, engedjük a homok/olaj átvágást is
+        return self._bfs_to_goal(start, allow_hazard=True)
+
+    # 1) FRONTIER-LOGIKA – szintén két fázisban
     def _is_frontier_cell(self, x: int, y: int) -> bool:
         """
         Frontier: bejárható, ismert cella, amelynek legalább egy UNKNOWN szomszédja van.
@@ -363,11 +408,7 @@ class LeftWallPolicy:
                     return True
         return False
 
-    def _find_frontier_step(self, start: Tuple[int,int]) -> Optional[Tuple[Tuple[int,int], str]]:
-        """
-        BFS az ismert pályán, hogy elérjünk egy frontier cellához.
-        Ha találunk, az első rácslépést adjuk vissza.
-        """
+    def _bfs_to_frontier(self, start: Tuple[int,int], allow_hazard: bool) -> Optional[Tuple[Tuple[int,int], str]]:
         H, W = self.world.shape
         sx, sy = start
 
@@ -385,12 +426,18 @@ class LeftWallPolicy:
             for dx, dy in DIRS_4:
                 nx, ny = x + dx, y + dy
                 if 0 <= nx < H and 0 <= ny < W:
-                    if (nx, ny) not in prev and self.world.traversable(nx, ny):
-                        prev[(nx, ny)] = (x, y)
-                        q.append((nx, ny))
+                    if (nx, ny) in prev:
+                        continue
+                    tile_val = int(self.world.known_map[nx, ny])
+                    if not is_traversable_val(tile_val):
+                        continue
+                    if (not allow_hazard) and is_hazard_val(tile_val):
+                        continue
+                    prev[(nx, ny)] = (x, y)
+                    q.append((nx, ny))
 
         if frontier is None:
-            return None  # nincs elérhető frontier
+            return None
 
         # Útvonal visszafejtése: frontier -> ... -> start
         path: List[Tuple[int,int]] = []
@@ -402,9 +449,12 @@ class LeftWallPolicy:
 
         if len(path) >= 2:
             next_step = path[1]
-            return next_step, "explore_frontier"
+            mode = "explore_frontier"
+            if allow_hazard and any(is_hazard_val(int(self.world.known_map[x, y])) for (x, y) in path[1:]):
+                mode = "explore_frontier_through_hazard"
+            return next_step, mode
         else:
-            # start maga frontier, válassz egy szomszédot, ami UNKNOWN-ok felé néz
+            # start maga frontier – válassz egy szomszédot, ami UNKNOWN felé néz
             best = None
             for dx, dy in DIRS_8:
                 nx, ny = sx + dx, sy + dy
@@ -423,10 +473,19 @@ class LeftWallPolicy:
                 return None
             return best[1], "explore_frontier_local"
 
+    def _find_frontier_step(self, start: Tuple[int,int]) -> Optional[Tuple[Tuple[int,int], str]]:
+        # 1) próbáljuk hazard nélkül
+        res = self._bfs_to_frontier(start, allow_hazard=False)
+        if res is not None:
+            return res
+        # 2) ha nincs ilyen út, engedjük a homok/olaj átvágást is
+        return self._bfs_to_frontier(start, allow_hazard=True)
+
     def next_grid_target(self, state: State) -> Tuple[Tuple[int,int], str]:
         """
-        0) Ha tudunk úton menni a GOAL-ra, menjünk oda.
-        1) Ha nem, akkor keressük meg a legközelebbi frontiert.
+        0) Ha tudunk úton menni a GOAL-ra, menjünk oda (először hazard nélkül, aztán
+           ha máshogy nem megy, homok/olajon át is).
+        1) Ha nem, akkor frontier-t keresünk ugyanígy két fázisban.
         2) Ha frontier sincs, lokálisan a legkevésbé látogatott, nem-hazard szomszéd.
         """
         assert state.agent is not None
@@ -436,12 +495,12 @@ class LeftWallPolicy:
         # 0) GOAL-prioritás
         goal_res = self._find_goal_step((ax, ay))
         if goal_res is not None:
-            return goal_res  # (target_cell, "go_goal" / "on_goal")
+            return goal_res  # (target_cell, "go_goal" / "go_goal_through_hazard" / "on_goal")
 
         # 1) FRONTIER keresés
         frontier_res = self._find_frontier_step((ax, ay))
         if frontier_res is not None:
-            return frontier_res  # (target_cell, "explore_frontier" / "explore_frontier_local")
+            return frontier_res  # (target_cell, "explore_frontier"...)
 
         # 2) Nincs frontier: lokális "legkevésbé látogatott" szomszéd (8 irány)
         H, W = self.world.shape
@@ -455,7 +514,6 @@ class LeftWallPolicy:
             haz = 1 if self._is_hazard(nx, ny) else 0
             vc = self._get_visit_count(nx, ny)
             dist = math.hypot(dx, dy)
-            # Rendezés: hazard (0=safe, 1=hazard), visit_count, distance
             candidates.append(((haz, vc, dist), (nx, ny)))
 
         if candidates:
@@ -467,7 +525,7 @@ class LeftWallPolicy:
         return (ax, ay), "stuck"
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Low-level driver (hazard-aware scoring)
+# Low-level driver (hazard-aware scoring + sand/oil adjust)
 # ────────────────────────────────────────────────────────────────────────────────
 
 def choose_accel_toward_cell(state: State,
@@ -483,6 +541,7 @@ def choose_accel_toward_cell(state: State,
     vx, vy = int(v[0]), int(v[1])
 
     ax_agent, ay_agent = int(state.agent.x), int(state.agent.y)
+    tx, ty = target_cell  # cél cella rács-koordinátája
     
     has_adjacent_zero_4dir = False
     for dx, dy in DIRS_4: 
@@ -530,21 +589,32 @@ def choose_accel_toward_cell(state: State,
         
     max_safe = max(1.0, math.sqrt(2 * max(0, rSafe)))
     
+    # alapsebesség cél
     if force_slow_down:
         target_speed = 1.0
     else:
-        tx, ty = target_cell
         target_is_hazard = world.is_hazard(tx, ty) if (0 <= tx < world.shape[0] and 0 <= ty < world.shape[1]) else False
 
         if (0 <= tx < world.shape[0] and 0 <= ty < world.shape[1] and
             world.visited_count[tx, ty] == 0 and not target_is_hazard):
+            # új, biztonságos cella -> mehet gyorsabban
             target_speed = max_safe
         elif mode.startswith("search_") or mode == "corridor_visited" or mode.startswith("fallback"):
             target_speed = max(1.0, 0.5 * max_safe)
         elif target_is_hazard:
+            # hazard felé általában óvatosabban
             target_speed = max(1.0, 0.5 * max_safe)
         else:
             target_speed = max(1.5, 0.7 * max_safe)
+
+    # felület-függő adjust: homokon/olajon lassítsunk erősen
+    if 0 <= tx < world.shape[0] and 0 <= ty < world.shape[1]:
+        if world.is_sand(tx, ty) or world.is_sand(ax_agent, ay_agent):
+            # homokon kontrollált lassú áthaladás
+            target_speed = min(target_speed, 1.0)
+        if world.is_oil(tx, ty) or world.is_oil(ax_agent, ay_agent):
+            # olajon a judge random gyorsítást ad – tartsuk nagyon alacsonyan a sebességet
+            target_speed = min(target_speed, 0.5)
 
     to_cell = np.array([target_cell[0], target_cell[1]], dtype=float) - p.astype(float)
     n_to = float(np.linalg.norm(to_cell)) or 1.0
@@ -578,8 +648,20 @@ def choose_accel_toward_cell(state: State,
             hazard_pen = 0.0
             if 0 <= nx < world.shape[0] and 0 <= ny < world.shape[1]:
                 visit_pen = 100.0 * float(world.visited_count[nx, ny])
-                if world.is_hazard(nx, ny):
+
+                if world.is_oil(nx, ny):
                     hazard_pen = 500.0
+                elif world.is_sand(nx, ny):
+                    hazard_pen = 300.0
+                elif world.is_hazard(nx, ny):
+                    hazard_pen = 400.0
+
+                # ha kifejezetten GOAL-ra megyünk, lazítsunk a hazard büntetésen
+                if mode.startswith("go_goal"):
+                    hazard_pen *= 0.2
+                # frontier esetén is lazább, ha muszáj átmenni rajta
+                elif mode.startswith("explore_frontier"):
+                    hazard_pen *= 0.5
 
             score = (2.0 * dist_cell) + (0.9 * speed_pen) + heading_pen + visit_pen + hazard_pen
             cand = (score, (ax, ay))
