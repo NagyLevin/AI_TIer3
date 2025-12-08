@@ -312,7 +312,7 @@ class WorldModel:
         self.hazard_char_pool = list("BCDFJKLMPQRTUVWXYZ")
 
         self.turn = 0
-        self.dump_file = "logs/map_dump.txt"
+        self.dump_file = "logs/map_dump1.txt"
         self._dump_initialized = False
 
     def updateWithObservation(self, st: State) -> None:

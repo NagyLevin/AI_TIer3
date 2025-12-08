@@ -18,8 +18,8 @@ class CellType(enum.Enum):
     UNKNOWN = 2
     EMPTY = 0
     NOT_VISIBLE = 3
-    OIL = 91      # olaj (spec leírás szerint)
-    SAND = 92     # homok
+    OIL = 91      # oil
+    SAND = 92     # sand
 
 class Player(NamedTuple):
     x: int
@@ -45,9 +45,9 @@ class State(NamedTuple):
     players: List[Player]
     agent: Optional[Player]
 
-# Hazard típus-azonosítók (homok/olaj) – könnyen átírható, ha a spec más
-SAND_TILES = {CellType.SAND.value}  # {92}
-OIL_TILES  = {CellType.OIL.value}   # {91}
+# Hazard tile sets
+SAND_TILES = {CellType.SAND.value}  # 92
+OIL_TILES  = {CellType.OIL.value}   # 91
 
 # ────────────────────────────────────────────────────────────────────────────────
 # I/O helpers
@@ -180,11 +180,10 @@ def is_oil_val(v: int) -> bool:
     return v in OIL_TILES
 
 def is_traversable_val(v: int) -> bool:
-    # UNKNOWN-ból nem tervezünk utat; minden más >=0 mehet (hazard is),
-    # de a BFS-ben opcionálisan kiszűrjük a hazardot.
+    # UNKNOWN-ra nem tervezünk utat; minden más >=0 mehet (hazard is),
+    # de a BFS-ben opcionálisan kizárjuk a hazardot.
     return (v >= 0) and (v != CellType.UNKNOWN.value)
 
-# minden nem klasszikus pozitív tile (pl. homok/olaj) hazard/new
 def is_hazard_val(v: int) -> bool:
     if is_sand_val(v) or is_oil_val(v):
         return True
@@ -208,8 +207,8 @@ class WorldModel:
         self.visited_count = np.zeros((H, W), dtype=int)
         self.last_pos: Optional[Tuple[int,int]] = None
 
-        # hazard típus-nyilvántartás
-        self.hazard_val = np.full((H, W), -1, dtype=int)  # -1 = nem hazard
+        # hazard type registry
+        self.hazard_val = np.full((H, W), -1, dtype=int)  # -1 = not hazard
         self.hazard_char_map: Dict[int, str] = {}
         self.hazard_char_pool = list("BCDFHJKLMPQRTUVWXYZ")
 
@@ -269,7 +268,7 @@ class WorldModel:
         return ch
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Explorer policy: GOAL-prioritás + frontier-alapú feltérképezés
+# Explorer policy: GOAL-first + frontier exploration
 # ────────────────────────────────────────────────────────────────────────────────
 
 def left_of(d: Tuple[int,int]) -> Tuple[int,int]:
@@ -286,17 +285,14 @@ def back_of(d: Tuple[int,int]) -> Tuple[int,int]:
 
 class LeftWallPolicy:
     """
-    GOAL-prioritásos, frontier-alapú explorer (a név csak kompatibilitás miatt maradt).
+    GOAL-prioritised, frontier-based explorer (name kept for compatibility).
 
-    Prioritási sorrend:
-      0) Ha van ismert, elérhető GOAL (100-as cella), arra megyünk.
-         Először csak biztonságos (nem-hazard) úton próbálunk – ha NINCS ilyen út,
-         akkor engedjük a homok/olaj (hazard) mezőkön át is a BFS-t.
-      1) Ha nincs GOAL, akkor hasonló logikával frontier-t keresünk (ismeretlen
-         szomszéddal rendelkező cella): először hazard kerülés, aztán ha muszáj,
-         homok/olajon át is.
-      2) Ha frontier sincs, akkor lokálisan a legkevésbé látogatott, nem-hazard
-         szomszéd felé megyünk.
+    Priority:
+      0) If GOAL (100) is known and reachable, go there.
+         - First try a non-hazard path.
+         - If impossible, allow sand/oil (hazard) tiles.
+      1) Else, go to a frontier cell (known, with UNKNOWN neighbour).
+      2) Else, local least-visited neighbour.
     """
     def __init__(self, world: WorldModel) -> None:
         self.world = world
@@ -333,7 +329,8 @@ class LeftWallPolicy:
         else:
             self.heading = (0, int(np.sign(vy)))
 
-    # 0) GOAL-BFS – két fázis: először hazard nélkül, majd hazarddal
+    # ── GOAL BFS (two phases: non-hazard, then hazard-allowed) ────────────────
+
     def _bfs_to_goal(self, start: Tuple[int,int], allow_hazard: bool) -> Optional[Tuple[Tuple[int,int], str]]:
         H, W = self.world.shape
         sx, sy = start
@@ -351,9 +348,7 @@ class LeftWallPolicy:
                 break
             for dx, dy in DIRS_4:
                 nx, ny = x + dx, y + dy
-                if 0 <= nx < H and 0 <= ny < W:
-                    if (nx, ny) in prev:
-                        continue
+                if 0 <= nx < H and 0 <= ny < W and (nx, ny) not in prev:
                     tile_val = int(self.world.known_map[nx, ny])
                     if not is_traversable_val(tile_val):
                         continue
@@ -365,36 +360,51 @@ class LeftWallPolicy:
         if goal is None:
             return None
 
-        # Útvonal visszafejtése: goal -> ... -> start
+        # reconstruct path
         path: List[Tuple[int,int]] = []
         cur = goal
         while cur is not None:
             path.append(cur)
             cur = prev[cur]
-        path.reverse()  # [start, ..., goal]
+        path.reverse()
 
         if len(path) == 1:
             return (path[0], "on_goal")
 
+        # estimate distance to first turn along the path
+        turn_dist = 999
+        if len(path) >= 3:
+            dir0 = (path[1][0] - path[0][0], path[1][1] - path[0][1])
+            turn_dist = len(path)
+            for i in range(2, len(path)):
+                diri = (path[i][0] - path[i-1][0], path[i][1] - path[i-1][1])
+                if diri != dir0:
+                    turn_dist = i - 1
+                    break
+
         next_step = path[1]
-        # ha a path-ban van hazard, jelöljük a módot ennek megfelelően
         mode = "go_goal"
         if allow_hazard and any(is_hazard_val(int(self.world.known_map[x, y])) for (x, y) in path[1:]):
             mode = "go_goal_through_hazard"
+
+        if turn_dist <= 3:
+            mode += "_turn_soon"
+        elif turn_dist <= 6:
+            mode += "_turn_med"
+
         return next_step, mode
 
     def _find_goal_step(self, start: Tuple[int,int]) -> Optional[Tuple[Tuple[int,int], str]]:
-        # 1) próbáljuk meg hazard NÉLKÜL
         res = self._bfs_to_goal(start, allow_hazard=False)
         if res is not None:
             return res
-        # 2) ha nincs ilyen út, engedjük a homok/olaj átvágást is
         return self._bfs_to_goal(start, allow_hazard=True)
 
-    # 1) FRONTIER-LOGIKA – szintén két fázisban
+    # ── FRONTIER BFS (same two-phase logic) ───────────────────────────────────
+
     def _is_frontier_cell(self, x: int, y: int) -> bool:
         """
-        Frontier: bejárható, ismert cella, amelynek legalább egy UNKNOWN szomszédja van.
+        Frontier: traversable, known cell with at least one UNKNOWN neighbour.
         """
         H, W = self.world.shape
         if not self.world.traversable(x, y):
@@ -425,9 +435,7 @@ class LeftWallPolicy:
                 break
             for dx, dy in DIRS_4:
                 nx, ny = x + dx, y + dy
-                if 0 <= nx < H and 0 <= ny < W:
-                    if (nx, ny) in prev:
-                        continue
+                if 0 <= nx < H and 0 <= ny < W and (nx, ny) not in prev:
                     tile_val = int(self.world.known_map[nx, ny])
                     if not is_traversable_val(tile_val):
                         continue
@@ -439,70 +447,85 @@ class LeftWallPolicy:
         if frontier is None:
             return None
 
-        # Útvonal visszafejtése: frontier -> ... -> start
         path: List[Tuple[int,int]] = []
         cur = frontier
         while cur is not None:
             path.append(cur)
             cur = prev[cur]
-        path.reverse()  # [start, ..., frontier]
+        path.reverse()
 
         if len(path) >= 2:
             next_step = path[1]
+
+            # distance to first turn
+            turn_dist = 999
+            if len(path) >= 3:
+                dir0 = (path[1][0] - path[0][0], path[1][1] - path[0][1])
+                turn_dist = len(path)
+                for i in range(2, len(path)):
+                    diri = (path[i][0] - path[i-1][0], path[i][1] - path[i-1][1])
+                    if diri != dir0:
+                        turn_dist = i - 1
+                        break
+
             mode = "explore_frontier"
             if allow_hazard and any(is_hazard_val(int(self.world.known_map[x, y])) for (x, y) in path[1:]):
                 mode = "explore_frontier_through_hazard"
+
+            if turn_dist <= 3:
+                mode += "_turn_soon"
+            elif turn_dist <= 6:
+                mode += "_turn_med"
+
             return next_step, mode
-        else:
-            # start maga frontier – válassz egy szomszédot, ami UNKNOWN felé néz
-            best = None
-            for dx, dy in DIRS_8:
-                nx, ny = sx + dx, sy + dy
-                if 0 <= nx < H and 0 <= ny < W and self.world.traversable(nx, ny):
-                    unknown_neighbors = 0
-                    for ddx, ddy in DIRS_4:
-                        ex, ey = nx + ddx, ny + ddy
-                        if 0 <= ex < H and 0 <= ey < W and \
-                           self.world.known_map[ex, ey] == CellType.UNKNOWN.value:
-                            unknown_neighbors += 1
-                    vc = self._get_visit_count(nx, ny)
-                    score = (-unknown_neighbors, vc)  # több UNKNOWN, kevesebb visit a jobb
-                    if best is None or score < best[0]:
-                        best = (score, (nx, ny))
-            if best is None:
-                return None
-            return best[1], "explore_frontier_local"
+
+        # start itself is frontier – local fallback
+        sx, sy = start
+        best = None
+        for dx, dy in DIRS_8:
+            nx, ny = sx + dx, sy + dy
+            if 0 <= nx < H and 0 <= ny < W and self.world.traversable(nx, ny):
+                unknown_neighbors = 0
+                for ddx, ddy in DIRS_4:
+                    ex, ey = nx + ddx, ny + ddy
+                    if 0 <= ex < H and 0 <= ey < W and \
+                       self.world.known_map[ex, ey] == CellType.UNKNOWN.value:
+                        unknown_neighbors += 1
+                vc = self._get_visit_count(nx, ny)
+                score = (-unknown_neighbors, vc)
+                if best is None or score < best[0]:
+                    best = (score, (nx, ny))
+        if best is None:
+            return None
+        return best[1], "explore_frontier_local"
 
     def _find_frontier_step(self, start: Tuple[int,int]) -> Optional[Tuple[Tuple[int,int], str]]:
-        # 1) próbáljuk hazard nélkül
         res = self._bfs_to_frontier(start, allow_hazard=False)
         if res is not None:
             return res
-        # 2) ha nincs ilyen út, engedjük a homok/olaj átvágást is
         return self._bfs_to_frontier(start, allow_hazard=True)
 
     def next_grid_target(self, state: State) -> Tuple[Tuple[int,int], str]:
         """
-        0) Ha tudunk úton menni a GOAL-ra, menjünk oda (először hazard nélkül, aztán
-           ha máshogy nem megy, homok/olajon át is).
-        1) Ha nem, akkor frontier-t keresünk ugyanígy két fázisban.
-        2) Ha frontier sincs, lokálisan a legkevésbé látogatott, nem-hazard szomszéd.
+        0) If we can path to GOAL, go there (first without hazards, then with).
+        1) Else go to a frontier cell.
+        2) Else local least-visited neighbour.
         """
         assert state.agent is not None
         ax, ay = int(state.agent.x), int(state.agent.y)
         self._ensure_heading(state)
 
-        # 0) GOAL-prioritás
+        # GOAL first
         goal_res = self._find_goal_step((ax, ay))
         if goal_res is not None:
-            return goal_res  # (target_cell, "go_goal" / "go_goal_through_hazard" / "on_goal")
+            return goal_res
 
-        # 1) FRONTIER keresés
+        # then frontier
         frontier_res = self._find_frontier_step((ax, ay))
         if frontier_res is not None:
-            return frontier_res  # (target_cell, "explore_frontier"...)
+            return frontier_res
 
-        # 2) Nincs frontier: lokális "legkevésbé látogatott" szomszéd (8 irány)
+        # local fallback
         H, W = self.world.shape
         candidates: List[Tuple[Tuple[int,int], Tuple[int,int]]] = []
         for dx, dy in DIRS_8:
@@ -521,11 +544,10 @@ class LeftWallPolicy:
             best_target = candidates[0][1]
             return best_target, "local_explore"
 
-        # Semmi sem elérhető, maradjunk
         return (ax, ay), "stuck"
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Low-level driver (hazard-aware scoring + sand/oil adjust)
+# Low-level driver (turn-aware slowing + hazard-aware scoring)
 # ────────────────────────────────────────────────────────────────────────────────
 
 def choose_accel_toward_cell(state: State,
@@ -533,6 +555,11 @@ def choose_accel_toward_cell(state: State,
                              policy: LeftWallPolicy,
                              target_cell: Tuple[int,int],
                              mode: str) -> Tuple[int,int]:
+    """
+    Low-level controller that is *explicitly* turn-aware.
+    - If the high-level mode string contains "turn_soon" / "turn_med",
+      we start braking early so we don't fly past openings and ping-pong.
+    """
     assert state.agent is not None and state.visible_track is not None
     rSafe = max(0, state.circuit.visibility_radius - 1)
 
@@ -541,90 +568,125 @@ def choose_accel_toward_cell(state: State,
     vx, vy = int(v[0]), int(v[1])
 
     ax_agent, ay_agent = int(state.agent.x), int(state.agent.y)
-    tx, ty = target_cell  # cél cella rács-koordinátája
-    
+    tx, ty = target_cell
+
+    # current speed magnitude
+    speed_now = float(math.hypot(vx, vy))
+
+    # ── 1. classic "0-cell" slowdown context ──────────────────────────────────
     has_adjacent_zero_4dir = False
-    for dx, dy in DIRS_4: 
+    for dx, dy in DIRS_4:
         nx, ny = ax_agent + dx, ay_agent + dy
         if (world.traversable(nx, ny) and
             world.known_map[nx, ny] == CellType.EMPTY.value and
             world.visited_count[nx, ny] == 0):
             has_adjacent_zero_4dir = True
             break
-            
+
     has_adjacent_zero_8dir = False
     if has_adjacent_zero_4dir:
-         has_adjacent_zero_8dir = True
+        has_adjacent_zero_8dir = True
     else:
-        for dx, dy in DIRS_8: 
+        for dx, dy in DIRS_8:
             nx, ny = ax_agent + dx, ay_agent + dy
             if (world.traversable(nx, ny) and
                 world.known_map[nx, ny] == CellType.EMPTY.value and
                 world.visited_count[nx, ny] == 0):
                 has_adjacent_zero_8dir = True
                 break
-            
+
     visible_zero_reachable = False
     if not has_adjacent_zero_8dir:
         visible_zero_reachable = find_reachable_zero(state, world, state.agent.pos)
 
-    force_slow_down = (not has_adjacent_zero_4dir and has_adjacent_zero_8dir) or \
-                      (not has_adjacent_zero_8dir and visible_zero_reachable)
-    
-    # FULL STOP override – ha kell lassítani, először próbáljunk fékezni
-    if force_slow_down and (vx != 0 or vy != 0):
+    force_slow_down = ((not has_adjacent_zero_4dir) and has_adjacent_zero_8dir) or \
+                      ((not has_adjacent_zero_8dir) and visible_zero_reachable)
+
+    # ── 2. NEW: turn-aware braking ────────────────────────────────────────────
+    turn_soon = ("turn_soon" in mode)
+    turn_med  = ("turn_med" in mode)
+
+    force_brake_for_turn = False
+    if turn_soon and speed_now > 1.0:
+        force_brake_for_turn = True
+    elif turn_med and speed_now > 2.5:
+        force_brake_for_turn = True
+
+    if (force_slow_down or force_brake_for_turn) and (vx != 0 or vy != 0):
         possible_brakes = [
-            (-int(np.sign(vx)), -int(np.sign(vy))),
-            (0, 0)
+            (-int(np.sign(vx)), -int(np.sign(vy))),  # full brake
+            (0, 0),                                  # coast
         ]
-        
         for ax, ay in possible_brakes:
             nvx, nvy = vx + ax, vy + ay
             next_pos = p + v + np.array([ax, ay], dtype=int)
-            
             if brakingOk(nvx, nvy, rSafe) and \
                validLineLocal(state, p, next_pos) and \
                not any(np.all(next_pos == q.pos) for q in state.players):
                 return ax, ay
-        
+
+    # ── 3. target speed with global cap ───────────────────────────────────────
     max_safe = max(1.0, math.sqrt(2 * max(0, rSafe)))
-    
-    # alapsebesség cél
+    max_safe = min(max_safe, 2.0)  # HARD CAP: about 2 tiles / turn
+
     if force_slow_down:
         target_speed = 1.0
     else:
-        target_is_hazard = world.is_hazard(tx, ty) if (0 <= tx < world.shape[0] and 0 <= ty < world.shape[1]) else False
+        target_is_hazard = (0 <= tx < world.shape[0] and
+                            0 <= ty < world.shape[1] and
+                            world.is_hazard(tx, ty))
 
         if (0 <= tx < world.shape[0] and 0 <= ty < world.shape[1] and
             world.visited_count[tx, ty] == 0 and not target_is_hazard):
-            # új, biztonságos cella -> mehet gyorsabban
             target_speed = max_safe
-        elif mode.startswith("search_") or mode == "corridor_visited" or mode.startswith("fallback"):
-            target_speed = max(1.0, 0.5 * max_safe)
+        elif mode.startswith("explore_frontier") or mode == "local_explore":
+            target_speed = max(1.0, 0.8 * max_safe)
         elif target_is_hazard:
-            # hazard felé általában óvatosabban
             target_speed = max(1.0, 0.5 * max_safe)
+        elif mode.startswith("go_goal"):
+            target_speed = max(1.5, 0.9 * max_safe)
         else:
             target_speed = max(1.5, 0.7 * max_safe)
 
-    # felület-függő adjust: homokon/olajon lassítsunk erősen
+    if turn_soon:
+        target_speed = min(target_speed, 1.0)
+    elif turn_med:
+        target_speed = min(target_speed, 1.5)
+
+    # surface-based adjustment: sand / oil
     if 0 <= tx < world.shape[0] and 0 <= ty < world.shape[1]:
         if world.is_sand(tx, ty) or world.is_sand(ax_agent, ay_agent):
-            # homokon kontrollált lassú áthaladás
             target_speed = min(target_speed, 1.0)
         if world.is_oil(tx, ty) or world.is_oil(ax_agent, ay_agent):
-            # olajon a judge random gyorsítást ad – tartsuk nagyon alacsonyan a sebességet
-            target_speed = min(target_speed, 0.5)
+            target_speed = min(target_speed, 0.6)
 
+    # ── 4. desired direction ──────────────────────────────────────────────────
     to_cell = np.array([target_cell[0], target_cell[1]], dtype=float) - p.astype(float)
     n_to = float(np.linalg.norm(to_cell)) or 1.0
     desired_dir = to_cell / n_to
 
+    if speed_now > 0.0:
+        vel_dir = np.array([vx, vy], dtype=float) / max(speed_now, 1e-9)
+        turn_cos = float(np.dot(vel_dir, desired_dir))
+        if turn_cos < 0.5:       # > ~60° turn
+            target_speed = min(target_speed, 1.0)
+        elif turn_cos < 0.8:     # ~36–60°
+            target_speed = min(target_speed, 1.5)
+
+    # ── 5. evaluate candidate accelerations ───────────────────────────────────
     best = None
 
     for ax in (-1, 0, 1):
         for ay in (-1, 0, 1):
             nvx, nvy = vx + ax, vy + ay
+            speed_next = float(math.hypot(nvx, nvy))
+
+            # forbid too high speeds near turns
+            if turn_soon and speed_next > 1.5:
+                continue
+            if turn_med and speed_next > 2.5:
+                continue
+
             if not brakingOk(nvx, nvy, rSafe):
                 continue
             next_pos = p + v + np.array([ax, ay], dtype=int)
@@ -635,8 +697,9 @@ def choose_accel_toward_cell(state: State,
             if any(np.all(next_pos == q.pos) for q in state.players):
                 continue
 
-            dist_cell = float(np.linalg.norm(next_pos.astype(float) - np.array(target_cell, dtype=float)))
-            speed_next = float(math.hypot(nvx, nvy))
+            dist_cell = float(np.linalg.norm(
+                next_pos.astype(float) - np.array(target_cell, dtype=float)
+            ))
             speed_pen = abs(speed_next - target_speed)
 
             heading_pen = 0.0
@@ -647,7 +710,13 @@ def choose_accel_toward_cell(state: State,
             visit_pen = 0.0
             hazard_pen = 0.0
             if 0 <= nx < world.shape[0] and 0 <= ny < world.shape[1]:
-                visit_pen = 100.0 * float(world.visited_count[nx, ny])
+                vc = float(world.visited_count[nx, ny])
+                if mode.startswith("go_goal"):
+                    visit_pen = 10.0 * vc
+                elif mode.startswith("explore_frontier"):
+                    visit_pen = 50.0 * vc
+                else:
+                    visit_pen = 100.0 * vc
 
                 if world.is_oil(nx, ny):
                     hazard_pen = 500.0
@@ -656,10 +725,8 @@ def choose_accel_toward_cell(state: State,
                 elif world.is_hazard(nx, ny):
                     hazard_pen = 400.0
 
-                # ha kifejezetten GOAL-ra megyünk, lazítsunk a hazard büntetésen
                 if mode.startswith("go_goal"):
                     hazard_pen *= 0.2
-                # frontier esetén is lazább, ha muszáj átmenni rajta
                 elif mode.startswith("explore_frontier"):
                     hazard_pen *= 0.5
 
@@ -671,7 +738,7 @@ def choose_accel_toward_cell(state: State,
     if best is not None:
         return best[1]
 
-    # végső fallback: fékezés / coast, ha még lehet
+    # ── 6. final fallback: brake / coast ──────────────────────────────────────
     for ax, ay in ((-np.sign(vx), -np.sign(vy)), (0, 0)):
         nvx, nvy = vx + ax, vy + ay
         nxt = p + v + np.array([ax, ay], dtype=int)
@@ -706,10 +773,10 @@ def dump_ascii(world: WorldModel, policy: LeftWallPolicy, state: State, mode: st
                 grid[x][y] = '.'
             elif v == CellType.UNKNOWN.value:
                 grid[x][y] = '?'
-            elif is_hazard_val(v):
+            elif is_hazard_val(int(v)):
                 grid[x][y] = world.get_hazard_char(int(v))
 
-    # visit-count overlay (nem hazardokra)
+    # visit-count overlay (non-hazards)
     for x in range(H):
         for y in range(W):
             vis_val = vis[x, y]
