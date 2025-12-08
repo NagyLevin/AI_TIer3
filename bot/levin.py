@@ -1,41 +1,44 @@
 import sys
-import os
 import enum
-import heapq
+import math
+import os
+from collections import deque
+from typing import Optional, NamedTuple, Tuple, List, Dict
+
 import numpy as np
 
-from typing import Optional, NamedTuple
-
+# ────────────────────────────────────────────────────────────────────────────────
+# Basic types (judge-compatible)
+# ────────────────────────────────────────────────────────────────────────────────
 
 class CellType(enum.Enum):
     """
-    Enum for the different cell types on the track.
-    These values come from the task description / environment:
-        0:  empty cell
-       -1:  wall cell (everything outside the map is also wall)
-        1:  start cell
-        2:  unknown (currently unused, reserved)
-        3:  cell is not visible (fog of war, used in world_model)
-       91:  oil cell
-       92:  sand cell
-      100: goal cell
+    CellType enum, a judge / grid_race_env kódjával kompatibilis értékekkel.
+
+      -1 : WALL
+       0 : EMPTY
+       1 : START
+       2 : UNKNOWN (belső jelölés, saját modellnek)
+       3 : NOT_VISIBLE (fog of war)
+      91 : OIL  (csúszós mező)
+      92 : SAND (homok, lassít)
+     100 : GOAL
     """
-    EMPTY = 0
-    WALL = -1
+    GOAL = 100
     START = 1
+    WALL = -1
     UNKNOWN = 2
+    EMPTY = 0
     NOT_VISIBLE = 3
     OIL = 91
     SAND = 92
-    GOAL = 100
 
 
 class Player(NamedTuple):
     """
-    Represents a player on the track.
-
-    x, y          : current grid position
-    vel_x, vel_y  : current velocity components
+    Játékos állapot:
+      x, y   : rács pozíció
+      vel_x, vel_y : sebesség komponensek
     """
     x: int
     y: int
@@ -44,26 +47,22 @@ class Player(NamedTuple):
 
     @property
     def pos(self) -> np.ndarray:
-        """
-        Returns the current position as a NumPy integer array [x, y].
-        """
         return np.array([self.x, self.y], dtype=int)
 
     @property
     def vel(self) -> np.ndarray:
         """
-        Returns the current velocity as a NumPy integer array [vel_x, vel_y].
+        A játékos sebességét adja vissza np.array([vel_x, vel_y]) formában.
         """
         return np.array([self.vel_x, self.vel_y], dtype=int)
 
 
 class Circuit(NamedTuple):
     """
-    Static information about the circuit:
-
-    track_shape       : (height, width) of the whole map
-    num_players       : number of players in this race
-    visibility_radius : radius of the local square the agent can see
+    Statikus pálya-információ:
+      track_shape       : (H, W)
+      num_players       : játékosok száma
+      visibility_radius : lokális látótávolság
     """
     track_shape: tuple[int, int]
     num_players: int
@@ -72,106 +71,43 @@ class Circuit(NamedTuple):
 
 class State(NamedTuple):
     """
-    Full internal state of our agent.
-
-    circuit       : static circuit info
-    visible_track : map used for planning (most up-to-date world_model)
-    players       : list of all players' (last known) positions
-    agent         : our own Player object
-    world_model   : persistent world model built from all observations so far
-                    (unknown cells are marked as CellType.NOT_VISIBLE)
+    Agent állapota:
+      circuit       : statikus pálya-információ
+      visible_track : "safe" map, NOT_VISIBLE -> WALL
+      visible_raw   : nyers látott map, NOT_VISIBLE benne marad 3-ként
+      players       : játékosok (legutóbbi ismert pozícióval)
+      agent         : saját Player
     """
     circuit: Circuit
     visible_track: Optional[np.ndarray]
-    players: list[Player]
+    visible_raw: Optional[np.ndarray]
+    players: List[Player]
     agent: Optional[Player]
-    world_model: np.ndarray
 
-
-# ---------------------------------------------------------------------- #
-# Globals: last position/velocity – to penalise turning back
-# ---------------------------------------------------------------------- #
-LAST_POS: Optional[np.ndarray] = None
-LAST_VEL: Optional[np.ndarray] = None
-
+# ────────────────────────────────────────────────────────────────────────────────
+# I/O helpers
+# ────────────────────────────────────────────────────────────────────────────────
 
 def read_initial_observation() -> Circuit:
     """
-    Reads the very first line from stdin that contains:
-        H W num_players visibility_radius
-    and returns the corresponding Circuit object.
+    Első sor beolvasása:
+      H W num_players visibility_radius
+    és Circuit objektummá alakítása.
     """
     H, W, num_players, visibility_radius = map(int, input().split())
     return Circuit((H, W), num_players, visibility_radius)
 
 
-def _update_world_model(
-    world_model: np.ndarray,
-    posx: int,
-    posy: int,
-    visibility_radius: int,
-    track_shape: tuple[int, int],
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Helper function that:
-      * reads the local visibility square from stdin,
-      * updates the persistent world_model with everything that is actually
-        visible (cells with value != CellType.NOT_VISIBLE),
-      * builds a "planning" map (visible_track) as a copy of the updated
-        world_model.
-
-    FONTOS: visible_track most már a world_model másolata, az ismeretlen
-    cellákat nem tekintjük automatikusan falnak (csak WALL blokkol).
-    """
-    height, width = track_shape
-
-    # Start from the previous world model for visible_track;
-    # we will update both when we actually see cells.
-    visible_track = world_model.copy()
-
-    for i in range(2 * visibility_radius + 1):
-        # One line of the local map centred on the agent
-        row_vals = [int(a) for a in input().split()]
-        x = posx - visibility_radius + i
-        if x < 0 or x >= height:
-            # This row lies completely outside the global track
-            continue
-
-        y_start = posy - visibility_radius
-        y_end = y_start + 2 * visibility_radius + 1
-
-        # Cut the row so that it fits into [0, width)
-        if y_start < 0:
-            row_vals = row_vals[-y_start:]
-            y_start = 0
-        if y_end > width:
-            row_vals = row_vals[:-(y_end - width)]
-            y_end = width
-
-        # Now row_vals has exactly (y_end - y_start) entries
-        for offset, cell_val in enumerate(row_vals):
-            y = y_start + offset
-
-            # Update persistent world model if the cell is actually visible.
-            if cell_val != CellType.NOT_VISIBLE.value:
-                world_model[x, y] = cell_val
-                visible_track[x, y] = cell_val
-
-    return visible_track, world_model
-
-
 def read_observation(old_state: State) -> Optional[State]:
     """
-    Reads the observation for the current turn from stdin and returns
-    a new State.
+    Egy kör megfigyelésének beolvasása.
 
-    Input per turn:
-      * one line with:  posx posy velx vely  (our agent)
-      * num_players lines with: pposx pposy   (other players)
-      * (2 * visibility_radius + 1) lines with the local map
+    Formátum:
+      - sor:  posx posy velx vely    (agent)
+      - num_players sor: pposx pposy (minden játékos)
+      - 2R+1 sor: lokális térkép
 
-    If the special line "~~~END~~~" is received, the game ended and
-    the function returns None.
+    Ha '~~~END~~~', akkor vége a játéknak -> None.
     """
     line = input()
     if line == '~~~END~~~':
@@ -179,497 +115,744 @@ def read_observation(old_state: State) -> Optional[State]:
 
     posx, posy, velx, vely = map(int, line.split())
     agent = Player(posx, posy, velx, vely)
-    players: list[Player] = []
+    circuit = old_state.circuit
 
-    circuit_data = old_state.circuit
-
-    for _ in range(circuit_data.num_players):
+    players: List[Player] = []
+    for _ in range(circuit.num_players):
         pposx, pposy = map(int, input().split())
         players.append(Player(pposx, pposy, 0, 0))
 
-    visible_track, world_model = _update_world_model(
-        old_state.world_model.copy(),
-        posx,
-        posy,
-        circuit_data.visibility_radius,
-        circuit_data.track_shape,
-    )
+    H, W = circuit.track_shape
+    R = circuit.visibility_radius
 
-    save_world_model(world_model)
+    # visible_raw: a teljes pályaméretre kiterített nyers map (3-asokkal)
+    visible_raw = np.full((H, W), CellType.NOT_VISIBLE.value, dtype=int)
+    # visible_track: konzervatív "biztonsági" map: NOT_VISIBLE -> WALL
+    visible_track = np.full((H, W), CellType.WALL.value, dtype=int)
+
+    for i in range(2 * R + 1):
+        row_vals = [int(a) for a in input().split()]
+        x = posx - R + i
+        if 0 <= x < H:
+            y_start = posy - R
+            y_end   = posy + R + 1
+            loc = row_vals
+            ys = y_start
+            if y_start < 0:
+                loc = loc[-y_start:]
+                ys = 0
+            if y_end > W:
+                loc = loc[:-(y_end - W)]
+            ye = ys + len(loc)
+            if ys < ye:
+                visible_raw[x, ys:ye] = loc
+                # NOT_VISIBLE -> WALL a tervezési mapben
+                safety = [
+                    CellType.WALL.value if v == CellType.NOT_VISIBLE.value else v
+                    for v in loc
+                ]
+                visible_track[x, ys:ye] = safety
 
     return old_state._replace(
         visible_track=visible_track,
+        visible_raw=visible_raw,
         players=players,
         agent=agent,
-        world_model=world_model,
     )
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Utilities
+# ────────────────────────────────────────────────────────────────────────────────
 
-def save_world_model(world_model: np.ndarray, fname: str = "logs/agentmap.txt") -> None:
+DIRS_4 = [(-1, 0), (0, 1), (1, 0), (0, -1)]
+DIRS_8 = [
+    (-1, 0), (0, 1), (1, 0), (0, -1),
+    (-1, -1), (-1, 1), (1, 1), (1, -1)
+]
+
+def tri(n: int) -> int:
     """
-    Saves the current world model into a text file (row of integers per line).
+    Háromszögszám: 1 + 2 + ... + n
+    A féktávolság becslésére használjuk.
     """
-    os.makedirs(os.path.dirname(fname), exist_ok=True)
-    with open(fname, "w", encoding="utf-8") as f:
-        for row in world_model:
-            f.write(" ".join(str(int(v)) for v in row))
-            f.write("\n")
+    return n * (n + 1) // 2
 
 
-def traversable(cell_value: int) -> bool:
+def brakingOk(vx: int, vy: int, rSafe: int) -> bool:
     """
-    Returns True if the given cell value is considered traversable
-    for path-checking purposes in the local planning map.
-
-    Csak a WALL (és a pályán kívüli rész) blokkol, az ismeretlen / homok /
-    olaj átjárható, csak nem kívánatos.
+    Ellenőrzi, hogy a jelenlegi sebességet le lehet-e fékezni
+    a látóhatáron belül (külön x és y irányban).
     """
-    return cell_value != CellType.WALL.value
+    return (tri(abs(vx)) <= rSafe) and (tri(abs(vy)) <= rSafe)
 
 
-def valid_line(state: State, pos1: np.ndarray, pos2: np.ndarray) -> bool:
+def validLineLocal(state: State, p1: np.ndarray, p2: np.ndarray) -> bool:
     """
-    Checks whether the straight line from pos1 to pos2 is free from walls
-    on the current planning map (state.visible_track).
-
-    Uses traversable(), így a homok/olaj/unknown átjárható,
-    de a fal blokkol.
+    Judge-féle line-of-sight ellenőrzés saját visible_track alapján.
+    Ha két cella közötti egyenes út végig nem fal, akkor True.
     """
-    assert state.visible_track is not None, "visible_track not initialised yet."
     track = state.visible_track
-    if (np.any(pos1 < 0) or np.any(pos2 < 0) or
-            np.any(pos1 >= track.shape) or np.any(pos2 >= track.shape)):
+    if track is None:
         return False
-    diff = pos2 - pos1
+    H, W = track.shape
+    if (np.any(p1 < 0) or np.any(p2 < 0) or
+        p1[0] >= H or p1[1] >= W or p2[0] >= H or p2[1] >= W):
+        return False
+    diff = p2 - p1
+    # függőleges komponens vizsgálata
     if diff[0] != 0:
         slope = diff[1] / diff[0]
-        d = int(np.sign(diff[0]))  # direction in x
+        d = int(np.sign(diff[0]))
         for i in range(abs(diff[0]) + 1):
-            x = int(pos1[0] + i * d)
-            y = pos1[1] + i * slope * d
-            y_ceil = int(np.ceil(y))
-            y_floor = int(np.floor(y))
-            if (not traversable(track[x, y_ceil])
-                    and not traversable(track[x, y_floor])):
+            x = int(p1[0] + i * d)
+            y = p1[1] + i * slope * d
+            yC = int(np.ceil(y))
+            yF = int(np.floor(y))
+            if (track[x, yC] < 0 and track[x, yF] < 0):
                 return False
+    # vízszintes komponens vizsgálata
     if diff[1] != 0:
         slope = diff[0] / diff[1]
-        d = int(np.sign(diff[1]))  # direction in y
+        d = int(np.sign(diff[1]))
         for i in range(abs(diff[1]) + 1):
-            x = pos1[0] + i * slope * d
-            y = int(pos1[1] + i * d)
-            x_ceil = int(np.ceil(x))
-            x_floor = int(np.floor(x))
-            if (not traversable(track[x_ceil, y])
-                    and not traversable(track[x_floor, y])):
+            x = p1[0] + i * slope * d
+            y = int(p1[1] + i * d)
+            xC = int(np.ceil(x))
+            xF = int(np.floor(x))
+            if (track[xC, y] < 0 and track[xF, y] < 0):
                 return False
     return True
 
 
-# ---------------------------------------------------------------------- #
-# A* PATH PLANNING HELPERS
-# ---------------------------------------------------------------------- #
-
-def build_traversable_mask(world_model: np.ndarray) -> np.ndarray:
+def find_reachable_zero(state: State, world: 'WorldModel', start_pos: np.ndarray) -> bool:
     """
-    Returns a boolean mask indicating which cells are traversable globally.
-
-    Globális tervezésben:
-      - WALL és NOT_VISIBLE = blokkolt,
-      - többi (EMPTY/START/OIL/SAND/GOAL) = járható, de OIL/SAND drágább lesz.
+    BFS-sel megnézi, hogy a jelenlegi látókörben van-e olyan
+    elérhető EMPTY cella, amit még nem látogattunk (visited_count == 0).
     """
-    traversable_mask = np.ones_like(world_model, dtype=bool)
-    blocked = (
-        (world_model == CellType.WALL.value) |
-        (world_model == CellType.NOT_VISIBLE.value)
-    )
-    traversable_mask[blocked] = False
-    return traversable_mask
+    if state.agent is None:
+        return False
 
+    q = deque([(int(start_pos[0]), int(start_pos[1]))])
+    visited = set([(int(start_pos[0]), int(start_pos[1]))])
 
-def collect_goals(world_model: np.ndarray,
-                  traversable_mask: np.ndarray) -> list[tuple[int, int]]:
+    H, W = world.shape
+    R = state.circuit.visibility_radius
+    ax, ay = int(state.agent.x), int(state.agent.y)
+
+    min_x, max_x = max(0, ax - R), min(H, ax + R + 1)
+    min_y, max_y = max(0, ay - R), min(W, ay + R + 1)
+
+    while q:
+        x, y = q.popleft()
+        if (world.known_map[x, y] == CellType.EMPTY.value and
+            world.visited_count[x, y] == 0):
+            return True
+
+        for dx, dy in DIRS_8:
+            nx, ny = x + dx, y + dy
+            if (min_x <= nx < max_x and min_y <= ny < max_y and
+                (nx, ny) not in visited):
+                if world.traversable(nx, ny):
+                    visited.add((nx, ny))
+                    q.append((nx, ny))
+    return False
+
+# ────────────────────────────────────────────────────────────────────────────────
+# World model + hazard tracking
+# ────────────────────────────────────────────────────────────────────────────────
+
+def is_traversable_val(v: int) -> bool:
     """
-    Goal cellák gyűjtése globális A*-hoz.
-
-    1) Ha van GOAL, azokat használjuk.
-    2) Különben frontier cellák (ismert, járható cella, ami UNKNOWN/NOT_VISIBLE
-       szomszéd mellett van) – így az ismeretlen határára megyünk.
+    Igaz, ha a cella bejárható:
+      - nem fal
+      - nem UNKNOWN (belső jelölés)
     """
-    h, w = world_model.shape
-
-    goal_positions = np.argwhere(world_model == CellType.GOAL.value)
-    if goal_positions.size > 0:
-        return [tuple(p) for p in goal_positions]
-
-    frontier: list[tuple[int, int]] = []
-    directions = [
-        (-1, 0), (1, 0), (0, -1), (0, 1),
-        (-1, -1), (-1, 1), (1, -1), (1, 1)
-    ]
-
-    for x in range(h):
-        for y in range(w):
-            if not traversable_mask[x, y]:
-                continue
-            cell = world_model[x, y]
-            if cell in (CellType.EMPTY.value,
-                        CellType.START.value,
-                        CellType.OIL.value,
-                        CellType.SAND.value):
-                for dx, dy in directions:
-                    nx = x + dx
-                    ny = y + dy
-                    if nx < 0 or ny < 0 or nx >= h or ny >= w:
-                        continue
-                    ncell = world_model[nx, ny]
-                    if ncell in (CellType.NOT_VISIBLE.value,
-                                 CellType.UNKNOWN.value):
-                        frontier.append((x, y))
-                        break
-
-    return frontier
+    return (v >= 0) and (v != CellType.UNKNOWN.value)
 
 
-def astar_any_goal(
-    traversable_mask: np.ndarray,
-    world_model: np.ndarray,
-    start: tuple[int, int],
-    goals: list[tuple[int, int]],
-) -> Optional[list[tuple[int, int]]]:
+def is_hazard_val(v: int) -> bool:
     """
-    A* path planner on a grid with 8-connected neighbourhood.
-
-    Új: terepköltségek
-      - EMPTY/START/GOAL: 1x
-      - OIL/SAND: 5x (nagy büntetés, de nem lehetetlen)
+    Igaz, ha a cella veszélyes (hazard):
+      - jelenleg: minden NEM negatív, ami NEM
+        EMPTY, START, GOAL, UNKNOWN, NOT_VISIBLE.
+      -> így OIL (91) és SAND (92) is hazard.
     """
-    if not goals:
-        return None
+    if v < 0:
+        return False
+    if v in (
+        CellType.EMPTY.value,
+        CellType.START.value,
+        CellType.GOAL.value,
+        CellType.UNKNOWN.value,
+        CellType.NOT_VISIBLE.value,
+    ):
+        return False
+    return True
 
-    h, w = traversable_mask.shape
-    if (start[0] < 0 or start[1] < 0 or
-            start[0] >= h or start[1] >= w):
-        return None
-    if not traversable_mask[start]:
-        return None
 
-    goal_set = set(goals)
-    goals_arr = np.array(goals, dtype=float)
+class WorldModel:
+    """
+    Perzisztens világtérkép:
+      - known_map      : eddig látott pályaértékek (eredeti kód: -1,0,1,91,92,100,3,...)
+      - visited_count  : hányszor jártunk az adott cellán
+      - hazard_val     : ha hazard, akkor a cella értéke (pl. 91, 92), különben -1
+      - hazard_char_map: hazard tile value -> betű, ASCII dumphoz
+    """
+    def __init__(self, shape: tuple[int, int]) -> None:
+        H, W = shape
+        self.shape = shape
+        self.known_map = np.full((H, W), CellType.UNKNOWN.value, dtype=int)
+        self.visited_count = np.zeros((H, W), dtype=int)
+        self.last_pos: Optional[Tuple[int, int]] = None
 
-    def heuristic(cell: tuple[int, int]) -> float:
-        cx, cy = cell
-        diff = goals_arr - np.array([cx, cy], dtype=float)
-        dists = np.sqrt((diff[:, 0] ** 2) + (diff[:, 1] ** 2))
-        return float(dists.min())
+        # hazard típus-nyilvántartás (tile-érték szerint)
+        self.hazard_val = np.full((H, W), -1, dtype=int)  # -1 = nem hazard
+        self.hazard_char_map: Dict[int, str] = {}
+        # H és O kimarad (H=Sand, O=Oil az ASCII dumpban)
+        self.hazard_char_pool = list("BCDFJKLMPQRTUVWXYZ")
 
-    def terrain_factor(x: int, y: int) -> float:
+        self.turn = 0
+        self.dump_file = "logs/map_dump.txt"
+        self._dump_initialized = False
+
+    def updateWithObservation(self, st: State) -> None:
         """
-        Terepköltség szorzó a (x,y) cellába lépéshez.
+        Beemeli az új megfigyelést:
+          - visible_raw alapján frissíti a known_map-et
+          - újraszámolja, hol vannak hazard cellák
         """
-        v = world_model[x, y]
-        if v in (CellType.OIL.value, CellType.SAND.value):
-            return 5.0
-        # minden más járható típus (EMPTY, START, GOAL, stb.)
-        return 1.0
+        if st.visible_raw is None:
+            return
+        raw = st.visible_raw
+        seen = (raw != CellType.NOT_VISIBLE.value)
+        self.known_map[seen] = raw[seen]
 
-    neighbours = [
-        (-1, 0, 1.0), (1, 0, 1.0),
-        (0, -1, 1.0), (0, 1, 1.0),
-        (-1, -1, np.sqrt(2)), (-1, 1, np.sqrt(2)),
-        (1, -1, np.sqrt(2)), (1, 1, np.sqrt(2))
-    ]
+        hazard_mask = np.vectorize(is_hazard_val)(self.known_map)
+        self.hazard_val[:, :] = -1
+        self.hazard_val[hazard_mask] = self.known_map[hazard_mask]
 
-    open_heap: list[tuple[float, tuple[int, int]]] = []
-    heapq.heappush(open_heap, (heuristic(start), start))
+    def traversable(self, x: int, y: int) -> bool:
+        """
+        Igaz, ha (x,y) pálya koordináta bejárható (nem fal, nem UNKNOWN).
+        """
+        H, W = self.shape
+        if not (0 <= x < H and 0 <= y < W):
+            return False
+        return is_traversable_val(self.known_map[x, y])
 
-    g_score: dict[tuple[int, int], float] = {start: 0.0}
-    parent: dict[tuple[int, int], tuple[int, int]] = {}
-    closed: set[tuple[int, int]] = set()
+    def is_hazard(self, x: int, y: int) -> bool:
+        """
+        Igaz, ha (x,y) hazard mező (pl. 91 = oil, 92 = sand).
+        """
+        H, W = self.shape
+        if not (0 <= x < H and 0 <= y < W):
+            return False
+        return int(self.hazard_val[x, y]) != -1
 
-    while open_heap:
-        f, current = heapq.heappop(open_heap)
-        if current in closed:
-            continue
-        closed.add(current)
+    def get_hazard_value(self, x: int, y: int) -> Optional[int]:
+        """
+        Visszaadja a cella hazard értékét (pl. 91, 92), ha van, különben None.
+        """
+        H, W = self.shape
+        if not (0 <= x < H and 0 <= y < W):
+            return None
+        v = int(self.hazard_val[x, y])
+        return v if v != -1 else None
 
-        if current in goal_set:
-            path = [current]
-            while current in parent:
-                current = parent[current]
-                path.append(current)
-            path.reverse()
-            return path
+    def get_hazard_char(self, tile_value: int) -> str:
+        """
+        A megadott hazard tile értékhez (pl. 91, 92, vagy bármi más)
+        visszaad egy ASCII betűt a map_dump vizualizációhoz.
 
-        cx, cy = current
-        for dx, dy, base_cost in neighbours:
-            nx = cx + dx
-            ny = cy + dy
-            if nx < 0 or ny < 0 or nx >= h or ny >= w:
-                continue
-            if not traversable_mask[nx, ny]:
-                continue
+        Oil (91) és Sand (92) speciális betűt kap a dump_ascii-ben (O/H),
+        ezért itt inkább más hazardokra használjuk a pool-t.
+        """
+        ch = self.hazard_char_map.get(tile_value)
+        if ch is not None:
+            return ch
+        if self.hazard_char_pool:
+            ch = self.hazard_char_pool.pop(0)
+        else:
+            ch = 'X'
+        self.hazard_char_map[tile_value] = ch
+        return ch
 
-            move_cost = base_cost * terrain_factor(nx, ny)
-            neighbour = (nx, ny)
-            tentative_g = g_score[current] + move_cost
+# ────────────────────────────────────────────────────────────────────────────────
+# Exploration policy (globális BFS, minimális backtrack)
+# ────────────────────────────────────────────────────────────────────────────────
 
-            old_g = g_score.get(neighbour, float("inf"))
-            if tentative_g < old_g:
-                g_score[neighbour] = tentative_g
-                parent[neighbour] = current
-                f_score = tentative_g + heuristic(neighbour)
-                heapq.heappush(open_heap, (f_score, neighbour))
-
-    return None
-
-
-def plan_global_path(state: State) -> Optional[list[tuple[int, int]]]:
+def left_of(d: Tuple[int,int]) -> Tuple[int,int]:
     """
-    Builds a global A* path from the agent to:
-      - the GOAL (if known), or
-      - the nearest frontier cell (boundary of unknown).
-
-    Plusz:
-      - saját cellánkat kivesszük a goals-ból (ha van más is), hogy ne
-        álljunk be sarokba célként.
-      - OIL/SAND magas útköltségű, így az A* is kerüli.
+    Balra forgatott irány (dx,dy) -> (-dy, dx)
+    (csak a heading vizualizációhoz tartjuk meg)
     """
-    assert state.agent is not None
-    world_model = state.world_model.copy()
-    traversable_mask = build_traversable_mask(world_model)
+    dx, dy = d
+    return (-dy, dx)
 
-    h, w = world_model.shape
-    for p in state.players:
-        if 0 <= p.x < h and 0 <= p.y < w:
-            traversable_mask[p.x, p.y] = False
+def right_of(d: Tuple[int,int]) -> Tuple[int,int]:
+    """
+    Jobbra forgatott irány (dx,dy) -> (dy, -dx)
+    (csak a heading vizualizációhoz tartjuk meg)
+    """
+    dx, dy = d
+    return (dy, -dx)
 
-    start = tuple(state.agent.pos.tolist())
-    goals = collect_goals(world_model, traversable_mask)
-    if not goals:
-        return None
+def back_of(d: Tuple[int,int]) -> Tuple[int,int]:
+    """
+    Hátrafelé mutató irány (dx,dy) -> (-dx, -dy)
+    """
+    dx, dy = d
+    return (-dx, -dy)
 
-    if len(goals) > 1:
-        goals = [g for g in goals if g != start]
-        if not goals:
+
+class LeftWallPolicy:
+    """
+    ÚJ POLITIKA: globális, BFS-alapú exploration, minimális backtrack.
+
+    Logika:
+      1) Ha már látjuk a GOAL cellát, arra tervezünk (BFS a pályán).
+      2) Ha nincs ismert GOAL:
+         - keressük a legközelebbi olyan EMPTY cellát, amit még nem
+           látogattunk (visited_count == 0) -> erre megyünk.
+      3) Ha már minden EMPTY cellát meglátogattuk:
+         - keressük a legközelebbi "frontier" cellát:
+             EMPTY vagy START, amelynek van UNKNOWN/NOT_VISIBLE szomszédja.
+      4) Ha ilyen sincs, akkor már mindent feltérképeztünk -> maradunk.
+
+    A heading mezőt csak a debug / ASCII log vizualizációjához használjuk.
+    """
+    def __init__(self, world: WorldModel) -> None:
+        self.world = world
+        self.heading: Tuple[int,int] = (0, 1)  # kezdeti "előre" irány
+
+    def _ensure_heading_from_velocity(self, state: State) -> None:
+        """
+        Ha a sebesség nem 0, akkor abból következtetünk a heading irányára.
+        """
+        if state.agent is None:
+            return
+        vx, vy = int(state.agent.vel_x), int(state.agent.vel_y)
+        if vx == 0 and vy == 0:
+            return
+        if abs(vx) >= abs(vy):
+            self.heading = (int(np.sign(vx)), 0)
+        else:
+            self.heading = (0, int(np.sign(vy)))
+
+    def _bfs_find(self,
+                  start: Tuple[int,int],
+                  cond) -> Optional[Tuple[int,int]]:
+        """
+        Általános BFS-kereső:
+          - start cellából indul,
+          - world.traversable grid-en mozog (4-irány),
+          - cond(x, y, world) feltételre hoz vissza az első cellát
+            (legkisebb BFS távolság).
+        """
+        H, W = self.world.shape
+        sx, sy = start
+        if not self.world.traversable(sx, sy):
             return None
 
-    return astar_any_goal(traversable_mask, world_model, start, goals)
+        q = deque([start])
+        seen = {start}
 
+        while q:
+            x, y = q.popleft()
+            if cond(x, y, self.world):
+                return (x, y)
+            for dx, dy in DIRS_4:
+                nx, ny = x + dx, y + dy
+                if (0 <= nx < H and 0 <= ny < W and
+                    (nx, ny) not in seen and
+                    self.world.traversable(nx, ny)):
+                    seen.add((nx, ny))
+                    q.append((nx, ny))
+        return None
 
-# ---------------------------------------------------------------------- #
-# MAIN DECISION FUNCTION
-# ---------------------------------------------------------------------- #
-
-def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
-    """
-    Main decision function.
-
-    - Globális A* a world_model alapján (cél: GOAL vagy frontier).
-    - A path mentén kiválasztunk egy előre néző waypointot (lookahead).
-    - Minden lehetséges accel (dx, dy) in {-1,0,1}^2 közül választunk:
-        * new_vel = self_vel + accel
-        * new_vel NEM lehet (0,0)  <-- sosem állunk meg
-        * sebességkorlát (VEL_MAX),
-        * valid_line + collision check,
-        * extra büntetés, ha OIL/SAND mezőre lépünk,
-        * kétlépcsős: ha van olyan lépés, ami nem megy visszafelé,
-          csak ezek közül választunk.
-    """
-    assert state.agent is not None, "Agent state not initialised."
-    assert state.visible_track is not None, "visible_track not initialised."
-
-    global LAST_POS, LAST_VEL
-
-    self_pos = state.agent.pos
-    self_vel = state.agent.vel
-
-    VEL_MAX = 4.0
-
-    path = plan_global_path(state)
-
-    # Choose lookahead waypoint
-    if path is not None and len(path) >= 2:
-        lookahead_index = min(len(path) - 1, 4)
-        target_cell = np.array(path[lookahead_index], dtype=float)
-    else:
-        target_cell = None
-
-    def valid_move(next_pos: np.ndarray, new_vel: np.ndarray) -> bool:
+    def next_grid_target(self, state: State) -> Tuple[Tuple[int,int], str]:
         """
-        A move is valid if:
-          * speed under VEL_MAX,
-          * line-of-sight free of walls,
-          * no collision with other players,
-          * nem maradunk ugyanazon a cellán.
+        Eldönti, hogy a rácson melyik cellára szeretnénk "tartani" ebben a körben.
+
+        Visszaad:
+          - cél cella (rácskoordináta)
+          - mód string debug / log célra
         """
-        if np.linalg.norm(new_vel, ord=2) > VEL_MAX:
-            return False
+        assert state.agent is not None
+        ax, ay = int(state.agent.x), int(state.agent.y)
 
-        if not valid_line(state, self_pos, next_pos):
-            return False
+        # heading csak vizualizációhoz kell
+        self._ensure_heading_from_velocity(state)
 
-        if np.all(next_pos == self_pos):
-            return False
+        # 1) Ha ismerünk GOAL-t, arra megyünk
+        def is_goal(x: int, y: int, world: WorldModel) -> bool:
+            return world.known_map[x, y] == CellType.GOAL.value
 
-        for p in state.players:
-            if np.all(next_pos == p.pos):
+        goal_cell = self._bfs_find((ax, ay), is_goal)
+        if goal_cell is not None:
+            gx, gy = goal_cell
+            dx, dy = gx - ax, gy - ay
+            if dx != 0 or dy != 0:
+                if abs(dx) >= abs(dy):
+                    self.heading = (int(np.sign(dx)), 0)
+                else:
+                    self.heading = (0, int(np.sign(dy)))
+            return goal_cell, "go_goal"
+
+        # 2) Legközelebbi EMPTY, amit még nem látogattunk
+        def is_unvisited_empty(x: int, y: int, world: WorldModel) -> bool:
+            return (world.known_map[x, y] == CellType.EMPTY.value and
+                    world.visited_count[x, y] == 0)
+
+        unv_cell = self._bfs_find((ax, ay), is_unvisited_empty)
+        if unv_cell is not None:
+            ux, uy = unv_cell
+            dx, dy = ux - ax, uy - ay
+            if dx != 0 or dy != 0:
+                if abs(dx) >= abs(dy):
+                    self.heading = (int(np.sign(dx)), 0)
+                else:
+                    self.heading = (0, int(np.sign(dy)))
+            return unv_cell, "explore_unvisited"
+
+        # 3) Ha minden EMPTY visited, keressünk frontier cellát
+        H, W = self.world.shape
+        def is_frontier(x: int, y: int, world: WorldModel) -> bool:
+            v = world.known_map[x, y]
+            if v not in (CellType.EMPTY.value, CellType.START.value):
                 return False
-        return True
+            for dx, dy in DIRS_4:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < H and 0 <= ny < W:
+                    nv = world.known_map[nx, ny]
+                    if nv in (CellType.UNKNOWN.value, CellType.NOT_VISIBLE.value):
+                        return True
+            return False
 
-    # Forward direction
-    if target_cell is not None:
-        forward_vec = target_cell - self_pos.astype(float)
-        if np.linalg.norm(forward_vec, ord=2) > 1e-6:
-            forward_unit = forward_vec / np.linalg.norm(forward_vec, ord=2)
-        else:
-            forward_unit = np.zeros(2, dtype=float)
+        frontier = self._bfs_find((ax, ay), is_frontier)
+        if frontier is not None:
+            fx, fy = frontier
+            dx, dy = fx - ax, fy - ay
+            if dx != 0 or dy != 0:
+                if abs(dx) >= abs(dy):
+                    self.heading = (int(np.sign(dx)), 0)
+                else:
+                    self.heading = (0, int(np.sign(dy)))
+            return frontier, "explore_frontier"
+
+        # 4) Minden feltérképezve => maradunk, nincs konkrét új cél
+        return (ax, ay), "fully_explored"
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Low-level driver (hazard-aware scoring)
+# ────────────────────────────────────────────────────────────────────────────────
+
+def choose_accel_toward_cell(state: State,
+                             world: WorldModel,
+                             policy: LeftWallPolicy,
+                             target_cell: Tuple[int,int],
+                             mode: str) -> Tuple[int,int]:
+    """
+    Low-level döntés:
+      - adott rácscella (target_cell) felé próbál gyorsítani,
+      - figyelembe veszi:
+          * féktávolságot (brakingOk),
+          * falakat (validLineLocal),
+          * ütközést más játékosokkal,
+          * minél kevesebbet járjunk már ismert cellákra (visited_count),
+          * erősen bünteti a hazard (oil/sand) cellákat.
+    """
+    assert state.agent is not None and state.visible_track is not None
+    rSafe = max(0, state.circuit.visibility_radius - 1)
+
+    p = state.agent.pos
+    v = state.agent.vel
+    vx, vy = int(v[0]), int(v[1])
+
+    ax_agent, ay_agent = int(state.agent.x), int(state.agent.y)
+
+    # Megnézzük, mennyire van közel "új" cella (EMPTY + visited_count==0),
+    # hogy ha közel van, lassítsunk, ne száguldjunk bele.
+    has_adjacent_zero_4dir = False
+    for dx, dy in DIRS_4:
+        nx, ny = ax_agent + dx, ay_agent + dy
+        if (world.traversable(nx, ny) and
+            world.known_map[nx, ny] == CellType.EMPTY.value and
+            world.visited_count[nx, ny] == 0):
+            has_adjacent_zero_4dir = True
+            break
+
+    has_adjacent_zero_8dir = False
+    if has_adjacent_zero_4dir:
+        has_adjacent_zero_8dir = True
     else:
-        if np.linalg.norm(self_vel, ord=2) > 1e-6:
-            forward_unit = self_vel.astype(float) / np.linalg.norm(
-                self_vel, ord=2
-            )
+        for dx, dy in DIRS_8:
+            nx, ny = ax_agent + dx, ay_agent + dy
+            if (world.traversable(nx, ny) and
+                world.known_map[nx, ny] == CellType.EMPTY.value and
+                world.visited_count[nx, ny] == 0):
+                has_adjacent_zero_8dir = True
+                break
+
+    visible_zero_reachable = False
+    if not has_adjacent_zero_8dir:
+        visible_zero_reachable = find_reachable_zero(state, world, state.agent.pos)
+
+    force_slow_down = ((not has_adjacent_zero_4dir) and has_adjacent_zero_8dir) or \
+                      ((not has_adjacent_zero_8dir) and visible_zero_reachable)
+
+    # Ha közel új cella felé közeledünk, előnyben részesítjük a lassítást,
+    # hogy ne rohanjunk túl rajta.
+    if force_slow_down and (vx != 0 or vy != 0):
+        possible_brakes = [
+            (-int(np.sign(vx)), -int(np.sign(vy))),
+            (0, 0)
+        ]
+
+        for ax, ay in possible_brakes:
+            nvx, nvy = vx + ax, vy + ay
+            next_pos = p + v + np.array([ax, ay], dtype=int)
+
+            if brakingOk(nvx, nvy, rSafe) and \
+               validLineLocal(state, p, next_pos) and \
+               not any(np.all(next_pos == q.pos) for q in state.players):
+                return ax, ay
+
+    # maximális "kényelmes" sebesség (a látóhatár függvényében)
+    max_safe = max(1.0, math.sqrt(2 * max(0, rSafe)))
+
+    # Célzott sebesség a mód alapján
+    if force_slow_down:
+        target_speed = 1.0
+    else:
+        tx, ty = target_cell
+        target_is_hazard = world.is_hazard(tx, ty) if (0 <= tx < world.shape[0] and 0 <= ty < world.shape[1]) else False
+
+        if (0 <= tx < world.shape[0] and 0 <= ty < world.shape[1] and
+            world.known_map[tx, ty] == CellType.EMPTY.value and
+            world.visited_count[tx, ty] == 0 and not target_is_hazard):
+            # Teljesen új cella: mehetünk bátrabban
+            target_speed = max_safe
+        elif mode.startswith("search_") or mode.startswith("fallback") or mode == "corridor_visited":
+            target_speed = max(1.0, 0.5 * max_safe)
+        elif target_is_hazard:
+            target_speed = max(1.0, 0.5 * max_safe)
         else:
-            forward_unit = np.array([0.0, 1.0])
+            target_speed = max(1.5, 0.7 * max_safe)
 
-    # Összes jelölt lépést eltároljuk, aztán kétlépcsős szűrés
-    candidates: list[dict] = []
+    # Cél irány vektor (rácskoordinátákon)
+    to_cell = np.array([target_cell[0], target_cell[1]], dtype=float) - p.astype(float)
+    n_to = float(np.linalg.norm(to_cell)) or 1.0
+    desired_dir = to_cell / n_to
 
-    h, w = state.world_model.shape
+    best = None
+    H, W = world.shape
 
-    for dx in range(-1, 2):
-        for dy in range(-1, 2):
-            accel = np.array([dx, dy], dtype=int)
-            new_vel = self_vel + accel
+    for ax in (-1, 0, 1):
+        for ay in (-1, 0, 1):
+            nvx, nvy = vx + ax, vy + ay
+            if not brakingOk(nvx, nvy, rSafe):
+                continue
+            next_pos = p + v + np.array([ax, ay], dtype=int)
+            nx, ny = int(next_pos[0]), int(next_pos[1])
 
-            # Nem állunk meg: tiltjuk a zéró sebességet
-            if np.all(new_vel == 0):
+            if not validLineLocal(state, p, next_pos):
+                continue
+            if any(np.all(next_pos == q.pos) for q in state.players):
                 continue
 
-            next_pos = self_pos + new_vel
+            dist_cell = float(np.linalg.norm(next_pos.astype(float) - np.array(target_cell, dtype=float)))
+            speed_next = float(math.hypot(nvx, nvy))
+            speed_pen = abs(speed_next - target_speed)
 
-            if not valid_move(next_pos, new_vel):
-                continue
+            heading_pen = 0.0
+            if speed_next > 0.0:
+                vel_dir = np.array([nvx, nvy], dtype=float) / max(speed_next, 1e-9)
+                heading_pen = (1.0 - float(np.dot(vel_dir, desired_dir))) * 0.8
 
-            # Távolság a path-waypointhoz
-            if target_cell is not None:
-                dist_to_target = float(
-                    np.linalg.norm(target_cell - next_pos.astype(float), ord=2)
-                )
-            else:
-                dist_to_target = 0.0
+            visit_pen = 0.0
+            hazard_pen = 0.0
+            if 0 <= nx < H and 0 <= ny < W:
+                visit_pen = 100.0 * float(world.visited_count[nx, ny])
+                if world.is_hazard(nx, ny):
+                    hazard_pen = 500.0
 
-            speed = float(np.linalg.norm(new_vel, ord=2))
+            score = (2.0 * dist_cell) + (0.9 * speed_pen) + heading_pen + visit_pen + hazard_pen
+            cand = (score, (ax, ay))
+            if (best is None) or (cand[0] < best[0]):
+                best = cand
 
-            # Irány-illeszkedés
-            if np.linalg.norm(new_vel, ord=2) > 1e-6:
-                vel_unit = new_vel.astype(float) / np.linalg.norm(
-                    new_vel, ord=2
-                )
-                forward_align = float(np.dot(vel_unit, forward_unit))
-            else:
-                forward_align = 0.0
+    if best is not None:
+        return best[1]
 
-            # Visszafordulás büntetése
-            backward_penalty = 0.0
-            if LAST_POS is not None:
-                move_from_last = self_pos.astype(float) - LAST_POS.astype(float)
-                if (np.linalg.norm(move_from_last, ord=2) > 1e-6 and
-                        np.linalg.norm(new_vel, ord=2) > 1e-6):
-                    dir_from_last = move_from_last / np.linalg.norm(
-                        move_from_last, ord=2
-                    )
-                    vel_unit2 = new_vel.astype(float) / np.linalg.norm(
-                        new_vel, ord=2
-                    )
-                    cos_angle = float(np.dot(vel_unit2, dir_from_last))
-                    if cos_angle < 0:
-                        backward_penalty = -cos_angle  # 0..2 kb
+    # Ha semmi sem megy, próbáljunk meg lassítani / megállni biztonságosan
+    for ax, ay in ((-np.sign(vx), -np.sign(vy)), (0, 0)):
+        nvx, nvy = vx + ax, vy + ay
+        nxt = p + v + np.array([ax, ay], dtype=int)
+        if brakingOk(nvx, nvy, rSafe) and validLineLocal(state, p, nxt):
+            if not any(np.all(nxt == q.pos) for q in state.players):
+                return int(ax), int(ay)
 
-            # Terep büntetés (lokálisan is kerüljük az olajat/homokot)
-            terrain_penalty = 0.0
-            x, y = int(next_pos[0]), int(next_pos[1])
-            if 0 <= x < h and 0 <= y < w:
-                cell = state.world_model[x, y]
-                if cell in (CellType.OIL.value, CellType.SAND.value):
-                    terrain_penalty = 3.0  # elég nagy, de nem végtelen
+    return (0, 0)
 
-            # Alap score – még NEM vesszük figyelembe, hogy hátrafelé van-e,
-            # csak eltároljuk (később kétlépcsősen szűrünk).
-            score = (
-                dist_to_target
-                + 0.2 * speed
-                - 0.5 * forward_align
-                + 0.8 * backward_penalty
-                + terrain_penalty
-            )
+# ────────────────────────────────────────────────────────────────────────────────
+# ASCII dump
+# ────────────────────────────────────────────────────────────────────────────────
 
-            candidates.append(
-                {
-                    "dx": dx,
-                    "dy": dy,
-                    "score": score,
-                    "back": backward_penalty,
-                }
-            )
+def dump_ascii(world: WorldModel, policy: LeftWallPolicy, state: State, mode: str) -> None:
+    """
+    ASCII pályalog kiírása.
 
-    if not candidates:
-        print(
-            "No valid move except maybe standing still – trapped?",
-            file=sys.stderr,
-        )
-        return (0, 0)
+    Speciális jelölések:
+      - '#' : fal
+      - '.' : üres
+      - 'G' : cél
+      - 'S' : start
+      - '?' : ismeretlen
+      - 'O' : Oil (tile 91)
+      - 'H' : Sand (tile 92)
+      - 'A' : agent
+      - 'O' (játékos) : más játékos pozíciója a rácson
+      - [1-9,a-z,+] : látogatásszám (nem hazard cellákon)
+    """
+    if state.agent is None:
+        return
+    H, W = world.shape
+    km = world.known_map
+    vis = world.visited_count
 
-    # Első lépés: próbáljunk olyan lépést választani, ami NEM megy hátra.
-    non_back = [c for c in candidates if c["back"] < 1e-6]
-    if non_back:
-        pool = non_back
-    else:
-        # Ha MINDEN lépés hátra megy, akkor kénytelenek vagyunk valamelyiket
-        # választani – zsákutcából vissza kell fordulni.
-        pool = candidates
+    grid = [['?' for _ in range(W)] for _ in range(H)]
+    for x in range(H):
+        for y in range(W):
+            v = km[x, y]
+            if v == CellType.WALL.value:
+                grid[x][y] = '#'
+            elif v == CellType.GOAL.value:
+                grid[x][y] = 'G'
+            elif v == CellType.START.value:
+                grid[x][y] = 'S'
+            elif v == CellType.EMPTY.value:
+                grid[x][y] = '.'
+            elif v == CellType.UNKNOWN.value:
+                grid[x][y] = '?'
+            elif int(v) == CellType.OIL.value:
+                grid[x][y] = 'O'   # Oil (91)
+            elif int(v) == CellType.SAND.value:
+                grid[x][y] = 'H'   # Sand (92)
+            elif is_hazard_val(v):
+                grid[x][y] = world.get_hazard_char(int(v))
 
-    # Második lépés: a kiválasztott pool-ból minimális score alapján döntünk.
-    best_score = min(c["score"] for c in pool)
-    best_moves = [
-        (c["dx"], c["dy"])
-        for c in pool
-        if abs(c["score"] - best_score) <= 1e-6
-    ]
+    # visit count overlay (nem hazard, nem fal, nem G/S)
+    for x in range(H):
+        for y in range(W):
+            vis_val = vis[x, y]
+            if vis_val > 0 and not world.is_hazard(x, y) and grid[x][y] not in ('#', 'G', 'S'):
+                if vis_val < 10:
+                    grid[x][y] = str(int(vis_val))
+                elif vis_val < 36:
+                    grid[x][y] = chr(ord('a') + int(vis_val) - 10)
+                else:
+                    grid[x][y] = '+'
 
-    chosen = tuple(rng.choice(best_moves))  # type: ignore[misc]
-    return chosen
+    # többi játékos
+    for p in state.players:
+        if 0 <= p.x < H and 0 <= p.y < W:
+            grid[p.x][p.y] = 'O'
 
+    # saját pozíció
+    ax, ay = int(state.agent.x), int(state.agent.y)
+    if 0 <= ax < H and 0 <= ay < W:
+        grid[ax][ay] = 'A'
+
+    hdr = []
+    hdr.append(
+        f"TURN {world.turn}  pos=({ax},{ay}) vel=({int(state.agent.vel_x)},{int(state.agent.vel_y)}) "
+        f"mode={mode} heading={policy.heading}"
+    )
+    hdr.append("LEGEND: #=WALL  ?=UNKNOWN  .=EMPTY  G=GOAL  S=START  A=agent  O=Oil  H=Sand  [1-9,a-z,+]=visit count")
+    if world.hazard_char_map:
+        hdr.append("OTHER HAZARD TYPES:")
+        for tile_val, ch in sorted(world.hazard_char_map.items(), key=lambda t: t[0]):
+            hdr.append(f"  {ch} = tile {tile_val}")
+
+    lines = ["\n".join(hdr)]
+    for x in range(H):
+        lines.append("".join(grid[x]))
+    lines.append("")
+
+    log_dir = os.path.dirname(world.dump_file)
+    if log_dir and not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+
+    mode_flag = "a"
+    if not world._dump_initialized:
+        mode_flag = "w"
+        world._dump_initialized = True
+    with open(world.dump_file, mode_flag, encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Decision loop
+# ────────────────────────────────────────────────────────────────────────────────
+
+def calculateMove(world: WorldModel, policy: LeftWallPolicy, state: State) -> Tuple[int,int]:
+    """
+    Fő döntési függvény egy körre:
+      - frissíti a világmodellt az aktuális megfigyeléssel,
+      - növeli az aktuális cella visited_count-ját,
+      - globális BFS-sel választ egy cél cellát (exploration logika),
+      - low-level szinten kiválasztja az ideális (ax, ay) gyorsítást,
+      - kiírja az ASCII-dumpot a logs/map_dump.txt-be.
+    """
+    assert state.agent is not None and state.visible_raw is not None
+    world.updateWithObservation(state)
+
+    ax, ay = int(state.agent.x), int(state.agent.y)
+    world.visited_count[ax, ay] += 1
+
+    target_cell, mode = policy.next_grid_target(state)
+    ax_cmd, ay_cmd = choose_accel_toward_cell(state, world, policy, target_cell, mode)
+
+    world.last_pos = (ax, ay)
+    dump_ascii(world, policy, state, mode)
+    world.turn += 1
+
+    return ax_cmd, ay_cmd
+
+# ────────────────────────────────────────────────────────────────────────────────
+# main
+# ────────────────────────────────────────────────────────────────────────────────
 
 def main():
     """
-    Entry point of the agent program.
+    Program belépési pontja:
+      - READY kiírás,
+      - Circuit beolvasása,
+      - WorldModel + Policy inicializálása,
+      - amíg nem jön ~~~END~~~:
+          * read_observation
+          * calculateMove
+          * (ax, ay) kiírása
     """
-    global LAST_POS, LAST_VEL
-
     print("READY", flush=True)
     circuit = read_initial_observation()
-    world_model = np.full(
-        circuit.track_shape, CellType.NOT_VISIBLE.value, dtype=int
-    )
-    state: Optional[State] = State(circuit, None, [], None, world_model)
-    rng = np.random.default_rng(seed=1)
+    state: Optional[State] = State(circuit, None, None, [], None)
 
-    prev_state: Optional[State] = None
+    world = WorldModel(circuit.track_shape)
+    policy = LeftWallPolicy(world)
 
     while True:
         assert state is not None
-        prev_state = state
         state = read_observation(state)
         if state is None:
             return
 
-        if prev_state is not None and prev_state.agent is not None:
-            LAST_POS = prev_state.agent.pos.copy()
-            LAST_VEL = prev_state.agent.vel.copy()
+        ax, ay = calculateMove(world, policy, state)
 
-        delta = calculate_move(rng, state)
-        print(f"{delta[0]} {delta[1]}", flush=True)
+        # biztos, ami biztos: -1..1 közé szorítjuk az accel komponenseket
+        ax = -1 if ax < -1 else (1 if ax > 1 else int(ax))
+        ay = -1 if ay < -1 else (1 if ay > 1 else int(ay))
+        print(f"{ax} {ay}", flush=True)
 
 
 if __name__ == "__main__":

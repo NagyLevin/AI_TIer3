@@ -18,8 +18,6 @@ class CellType(enum.Enum):
     UNKNOWN = 2
     EMPTY = 0
     NOT_VISIBLE = 3
-    SAND = 92     
-    OIL = 91      
 
 class Player(NamedTuple):
     x: int
@@ -170,6 +168,7 @@ def find_reachable_zero(state: State, world: 'WorldModel', start_pos: np.ndarray
 # ────────────────────────────────────────────────────────────────────────────────
 
 def is_traversable_val(v: int) -> bool:
+    # UNKNOWN-ból nem tervezünk utat, csak amit már láttunk (>=0, nem UNKNOWN)
     return (v >= 0) and (v != CellType.UNKNOWN.value)
 
 # minden nem klasszikus pozitív tile hazard/new
@@ -194,7 +193,7 @@ class WorldModel:
         self.visited_count = np.zeros((H, W), dtype=int)
         self.last_pos: Optional[Tuple[int,int]] = None
 
-        # hazard típus-nyilvántartás (tile-érték szerint)
+        # hazard típus-nyilvántartás
         self.hazard_val = np.full((H, W), -1, dtype=int)  # -1 = nem hazard
         self.hazard_char_map: Dict[int, str] = {}
         self.hazard_char_pool = list("BCDFHJKLMPQRTUVWXYZ")
@@ -243,7 +242,7 @@ class WorldModel:
         return ch
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Left-hand wall follower (hazard-aware)
+# Explorer policy: GOAL-prioritás + frontier-alapú feltérképezés
 # ────────────────────────────────────────────────────────────────────────────────
 
 def left_of(d: Tuple[int,int]) -> Tuple[int,int]:
@@ -259,9 +258,17 @@ def back_of(d: Tuple[int,int]) -> Tuple[int,int]:
     return (-dx, -dy)
 
 class LeftWallPolicy:
+    """
+    GOAL-prioritásos, frontier-alapú explorer (a név csak kompatibilitásból maradt).
+
+    Prioritási sorrend:
+    0) Ha van ismert, elérhető GOAL (100-as cella), arra megyünk (legrövidebb út BFS-sel).
+    1) Ha nincs GOAL, akkor BFS-sel frontier-t keresünk (ismeretlen szomszéddal rendelkező cella).
+    2) Ha frontier sincs, akkor lokálisan a legkevésbé látogatott, nem-hazard szomszéd felé megyünk.
+    """
     def __init__(self, world: WorldModel) -> None:
         self.world = world
-        self.heading: Tuple[int,int] = (0, 1)
+        self.heading: Tuple[int,int] = (0, 1)    # default EAST
 
     def _is_wall_local(self, state: State, x: int, y: int) -> bool:
         if state.visible_raw is None: return False
@@ -294,148 +301,170 @@ class LeftWallPolicy:
         else:
             self.heading = (0, int(np.sign(vy)))
 
-    def _get_fallback_4dir_target(self, state: State, 
-                                  pos: Tuple[int,int], 
-                                  coords: Tuple[int, ...], 
-                                  dirs: Tuple[Tuple[int,int], ...]) -> Tuple[Tuple[int,int], str]:
-        ax, ay = pos
-        l1x, l1y, f1x, f1y, r1x, r1y = coords
-        dL, dF, dR, dB = dirs
-        
-        if self._is_free_local(state, l1x, l1y) and not self._is_hazard(l1x, l1y):
-            self.heading = dL
-            return (l1x, l1y), "fallback_left"
-        if self._is_free_local(state, f1x, f1y) and not self._is_hazard(f1x, f1y):
-            self.heading = dF
-            return (f1x, f1y), "fallback_forward"
-        if self._is_free_local(state, r1x, r1y) and not self._is_hazard(r1x, r1y):
-            self.heading = dR
-            return (r1x, r1y), "fallback_right"
+    # 0) GOAL-BFS
+    def _find_goal_step(self, start: Tuple[int,int]) -> Optional[Tuple[Tuple[int,int], str]]:
+        """
+        BFS az ismert pályán, hogy elérjük a legközelebbi GOAL (100) cellát.
+        Ha találunk utat, az első rácslépést (start -> next_step) adjuk vissza.
+        """
+        H, W = self.world.shape
+        sx, sy = start
 
-        if self._is_free_local(state, l1x, l1y):
-            self.heading = dL
-            return (l1x, l1y), "fallback_left_hazard"
-        if self._is_free_local(state, f1x, f1y):
-            self.heading = dF
-            return (f1x, f1y), "fallback_forward_hazard"
-        if self._is_free_local(state, r1x, r1y):
-            self.heading = dR
-            return (r1x, r1y), "fallback_right_hazard"
-        
-        return (ax, ay), "stuck"
+        q = deque()
+        q.append((sx, sy))
+        prev: Dict[Tuple[int,int], Optional[Tuple[int,int]]] = {(sx, sy): None}
+
+        goal: Optional[Tuple[int,int]] = None
+
+        while q:
+            x, y = q.popleft()
+            if self.world.known_map[x, y] == CellType.GOAL.value:
+                goal = (x, y)
+                break
+            for dx, dy in DIRS_4:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < H and 0 <= ny < W:
+                    if (nx, ny) not in prev and self.world.traversable(nx, ny):
+                        prev[(nx, ny)] = (x, y)
+                        q.append((nx, ny))
+
+        if goal is None:
+            return None  # még nem látjuk / nem érjük el a célt
+
+        # Útvonal visszafejtése: goal -> ... -> start
+        path: List[Tuple[int,int]] = []
+        cur = goal
+        while cur is not None:
+            path.append(cur)
+            cur = prev[cur]
+        path.reverse()  # [start, ..., goal]
+
+        if len(path) == 1:
+            # már a célon állunk
+            return (path[0], "on_goal")
+
+        next_step = path[1]
+        return next_step, "go_goal"
+
+    # 1) FRONTIER-LOGIKA
+    def _is_frontier_cell(self, x: int, y: int) -> bool:
+        """
+        Frontier: bejárható, ismert cella, amelynek legalább egy UNKNOWN szomszédja van.
+        """
+        H, W = self.world.shape
+        if not self.world.traversable(x, y):
+            return False
+        if self.world.known_map[x, y] == CellType.UNKNOWN.value:
+            return False
+        for dx, dy in DIRS_4:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < H and 0 <= ny < W:
+                if self.world.known_map[nx, ny] == CellType.UNKNOWN.value:
+                    return True
+        return False
+
+    def _find_frontier_step(self, start: Tuple[int,int]) -> Optional[Tuple[Tuple[int,int], str]]:
+        """
+        BFS az ismert pályán, hogy elérjünk egy frontier cellához.
+        Ha találunk, az első rácslépést adjuk vissza.
+        """
+        H, W = self.world.shape
+        sx, sy = start
+
+        q = deque()
+        q.append((sx, sy))
+        prev: Dict[Tuple[int,int], Optional[Tuple[int,int]]] = {(sx, sy): None}
+
+        frontier: Optional[Tuple[int,int]] = None
+
+        while q:
+            x, y = q.popleft()
+            if (x, y) != (sx, sy) and self._is_frontier_cell(x, y):
+                frontier = (x, y)
+                break
+            for dx, dy in DIRS_4:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < H and 0 <= ny < W:
+                    if (nx, ny) not in prev and self.world.traversable(nx, ny):
+                        prev[(nx, ny)] = (x, y)
+                        q.append((nx, ny))
+
+        if frontier is None:
+            return None  # nincs elérhető frontier
+
+        # Útvonal visszafejtése: frontier -> ... -> start
+        path: List[Tuple[int,int]] = []
+        cur = frontier
+        while cur is not None:
+            path.append(cur)
+            cur = prev[cur]
+        path.reverse()  # [start, ..., frontier]
+
+        if len(path) >= 2:
+            next_step = path[1]
+            return next_step, "explore_frontier"
+        else:
+            # start maga frontier, válassz egy szomszédot, ami UNKNOWN-ok felé néz
+            best = None
+            for dx, dy in DIRS_8:
+                nx, ny = sx + dx, sy + dy
+                if 0 <= nx < H and 0 <= ny < W and self.world.traversable(nx, ny):
+                    unknown_neighbors = 0
+                    for ddx, ddy in DIRS_4:
+                        ex, ey = nx + ddx, ny + ddy
+                        if 0 <= ex < H and 0 <= ey < W and \
+                           self.world.known_map[ex, ey] == CellType.UNKNOWN.value:
+                            unknown_neighbors += 1
+                    vc = self._get_visit_count(nx, ny)
+                    score = (-unknown_neighbors, vc)  # több UNKNOWN, kevesebb visit a jobb
+                    if best is None or score < best[0]:
+                        best = (score, (nx, ny))
+            if best is None:
+                return None
+            return best[1], "explore_frontier_local"
 
     def next_grid_target(self, state: State) -> Tuple[Tuple[int,int], str]:
+        """
+        0) Ha tudunk úton menni a GOAL-ra, menjünk oda.
+        1) Ha nem, akkor keressük meg a legközelebbi frontiert.
+        2) Ha frontier sincs, lokálisan a legkevésbé látogatott, nem-hazard szomszéd.
+        """
         assert state.agent is not None
         ax, ay = int(state.agent.x), int(state.agent.y)
         self._ensure_heading(state)
 
-        current_visit_count = self._get_visit_count(ax, ay)
+        # 0) GOAL-prioritás
+        goal_res = self._find_goal_step((ax, ay))
+        if goal_res is not None:
+            return goal_res  # (target_cell, "go_goal" / "on_goal")
 
-        dF = self.heading
-        dL = left_of(dF)
-        dR = right_of(dF)
-        dB = back_of(dF)
+        # 1) FRONTIER keresés
+        frontier_res = self._find_frontier_step((ax, ay))
+        if frontier_res is not None:
+            return frontier_res  # (target_cell, "explore_frontier" / "explore_frontier_local")
 
-        l1x, l1y = ax + dL[0], ay + dL[1]
-        l2x, l2y = ax + dL[0]*2, ay + dL[1]*2
-        
-        r1x, r1y = ax + dR[0], ay + dR[1]
-        r2x, r2y = ax + dR[0]*2, ay + dR[1]*2
-        
-        f1x, f1y = ax + dF[0], ay + dF[1]
-        b1x, b1y = ax + dB[0], ay + dB[1]
+        # 2) Nincs frontier: lokális "legkevésbé látogatott" szomszéd (8 irány)
+        H, W = self.world.shape
+        candidates: List[Tuple[Tuple[int,int], Tuple[int,int]]] = []
+        for dx, dy in DIRS_8:
+            nx, ny = ax + dx, ay + dy
+            if not (0 <= nx < H and 0 <= ny < W):
+                continue
+            if not self._is_free_local(state, nx, ny):
+                continue
+            haz = 1 if self._is_hazard(nx, ny) else 0
+            vc = self._get_visit_count(nx, ny)
+            dist = math.hypot(dx, dy)
+            # Rendezés: hazard (0=safe, 1=hazard), visit_count, distance
+            candidates.append(((haz, vc, dist), (nx, ny)))
 
-        if self._is_hazard(ax, ay):
-            candidates: List[Tuple[int, float, Tuple[int,int], Tuple[int,int]]] = []
-            for dx, dy in DIRS_8:
-                nx, ny = ax + dx, ay + dy
-                if self._is_free_local(state, nx, ny) and not self._is_hazard(nx, ny):
-                    vc = self._get_visit_count(nx, ny)
-                    dist = math.hypot(dx, dy)
-                    candidates.append((vc, dist, (nx, ny), (dx, dy)))
-            if candidates:
-                candidates.sort()
-                best_vc, _, best_target, best_dir = candidates[0]
-                if best_dir != (0, 0):
-                    if abs(best_dir[0]) >= abs(best_dir[1]):
-                        self.heading = (int(np.sign(best_dir[0])), 0)
-                    else:
-                        self.heading = (0, int(np.sign(best_dir[1])))
-                return best_target, "escape_hazard"
-
-        wall_on_left = self._is_wall_local(state, l1x, l1y) or self._is_wall_local(state, l2x, l2y)
-        wall_on_right = self._is_wall_local(state, r1x, r1y) or self._is_wall_local(state, r2x, r2y)
-        front_is_free = self._is_free_local(state, f1x, f1y)
-        
-        if wall_on_left and wall_on_right and front_is_free:
-            self.heading = dF
-            front_visit_count = self._get_visit_count(f1x, f1y)
-            if front_visit_count == 0 and not self._is_hazard(f1x, f1y):
-                return (f1x, f1y), "corridor_unvisited"
-            else:
-                return (f1x, f1y), "corridor_visited"
-
-        if current_visit_count > 1:
-            candidates = []
-            for dx, dy in DIRS_8:
-                nx, ny = ax + dx, ay + dy
-                if self._is_free_local(state, nx, ny):
-                    visit_count = self._get_visit_count(nx, ny)
-                    distance = math.hypot(dx, dy)
-                    hazard_flag = 1 if self._is_hazard(nx, ny) else 0
-                    candidates.append((hazard_flag, visit_count, distance, (nx, ny), (dx, dy)))
-
-            if not candidates:
-                return self._get_fallback_4dir_target(
-                    state, (ax,ay), 
-                    (l1x, l1y, f1x, f1y, r1x, r1y), 
-                    (dL, dF, dR, dB)
-                )
-                
+        if candidates:
             candidates.sort()
-            best_hazard, best_vc, _, best_target, best_dir = candidates[0]
-            
-            if best_dir != (0,0):
-                if abs(best_dir[0]) >= abs(best_dir[1]):
-                    self.heading = (int(np.sign(best_dir[0])), 0)
-                else:
-                    self.heading = (0, int(np.sign(best_dir[1])))
+            best_target = candidates[0][1]
+            return best_target, "local_explore"
 
-            mode = "search_8dir" if best_vc > 0 else "explore_8dir"
-            if best_hazard:
-                mode += "_hazard"
-            return best_target, mode
-
-        else:
-            candidates = []
-            if self._is_free_local(state, l1x, l1y):
-                haz = 1 if self._is_hazard(l1x, l1y) else 0
-                candidates.append((haz, self._get_visit_count(l1x, l1y), 0, (l1x, l1y), "turn_left", dL))
-            if self._is_free_local(state, f1x, f1y):
-                haz = 1 if self._is_hazard(f1x, f1y) else 0
-                candidates.append((haz, self._get_visit_count(f1x, f1y), 1, (f1x, f1y), "forward", dF))
-            if self._is_free_local(state, r1x, r1y):
-                haz = 1 if self._is_hazard(r1x, r1y) else 0
-                candidates.append((haz, self._get_visit_count(r1x, r1y), 2, (r1x, r1y), "turn_right", dR))
-            if self._is_free_local(state, b1x, b1y):
-                haz = 1 if self._is_hazard(b1x, b1y) else 0
-                candidates.append((haz, self._get_visit_count(b1x, b1y), 3, (b1x, b1y), "turn_back", dB))
-
-            if not candidates:
-                return (ax, ay), "stuck"
-                
-            candidates.sort()
-            best_hazard, best_vc, _, best_target, best_mode, best_heading = candidates[0]
-            
-            self.heading = best_heading
-            
-            if best_vc > 0:
-                mode = "search_4dir_" + best_mode
-            else:
-                mode = best_mode
-            if best_hazard:
-                mode += "_hazard"
-            return best_target, mode
+        # Semmi sem elérhető, maradjunk
+        return (ax, ay), "stuck"
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Low-level driver (hazard-aware scoring)
@@ -483,6 +512,7 @@ def choose_accel_toward_cell(state: State,
     force_slow_down = (not has_adjacent_zero_4dir and has_adjacent_zero_8dir) or \
                       (not has_adjacent_zero_8dir and visible_zero_reachable)
     
+    # FULL STOP override – ha kell lassítani, először próbáljunk fékezni
     if force_slow_down and (vx != 0 or vy != 0):
         possible_brakes = [
             (-int(np.sign(vx)), -int(np.sign(vy))),
@@ -559,6 +589,7 @@ def choose_accel_toward_cell(state: State,
     if best is not None:
         return best[1]
 
+    # végső fallback: fékezés / coast, ha még lehet
     for ax, ay in ((-np.sign(vx), -np.sign(vy)), (0, 0)):
         nvx, nvy = vx + ax, vy + ay
         nxt = p + v + np.array([ax, ay], dtype=int)
@@ -573,7 +604,6 @@ def choose_accel_toward_cell(state: State,
 # ────────────────────────────────────────────────────────────────────────────────
 
 def dump_ascii(world: WorldModel, policy: LeftWallPolicy, state: State, mode: str) -> None:
- 
     if state.agent is None:
         return
     H, W = world.shape
@@ -594,15 +624,10 @@ def dump_ascii(world: WorldModel, policy: LeftWallPolicy, state: State, mode: st
                 grid[x][y] = '.'
             elif v == CellType.UNKNOWN.value:
                 grid[x][y] = '?'
-            # ────────────── ITT A KÉRT VÁLTOZTATÁS ──────────────
-            elif int(v) == 91:
-                grid[x][y] = 'O'   # 91-es tile (olaj) -> 'O'
-            elif int(v) == 92:
-                grid[x][y] = 'H'   # 92-es tile (homok) -> 'H'
-            # ────────────── A TÖBBI HAZARD MARAD RÉGI RENDSZER ──────────────
             elif is_hazard_val(v):
                 grid[x][y] = world.get_hazard_char(int(v))
 
+    # visit-count overlay (nem hazardokra)
     for x in range(H):
         for y in range(W):
             vis_val = vis[x, y]
@@ -627,13 +652,11 @@ def dump_ascii(world: WorldModel, policy: LeftWallPolicy, state: State, mode: st
         f"TURN {world.turn}  pos=({ax},{ay}) vel=({int(state.agent.vel_x)},{int(state.agent.vel_y)}) "
         f"mode={mode} heading={policy.heading}"
     )
-    hdr.append("LEGEND: #=WALL  ?=UNKNOWN  .=EMPTY  G=GOAL  S=START  A=agent  O=OiL H=Sand  [1-9,a-z,+]=visit count")
+    hdr.append("LEGEND: #=WALL  ?=UNKNOWN  .=EMPTY  G=GOAL  S=START  A=agent  O=other  [1-9,a-z,+]=visit count")
     if world.hazard_char_map:
         hdr.append("HAZARD TYPES:")
         for tile_val, ch in sorted(world.hazard_char_map.items(), key=lambda t: t[0]):
             hdr.append(f"  {ch} = tile {tile_val}")
-    # opcionálisan hozzáírhatod:
-    # hdr.append("SPECIAL: O = tile 91 (oil), H = tile 92 (sand)")
 
     lines = ["\n".join(hdr)]
     for x in range(H):
@@ -691,6 +714,7 @@ def main():
 
         ax, ay = calculateMove(world, policy, state)
 
+        # clamp to judge-legal range
         ax = -1 if ax < -1 else (1 if ax > 1 else int(ax))
         ay = -1 if ay < -1 else (1 if ay > 1 else int(ay))
         print(f"{ax} {ay}", flush=True)
