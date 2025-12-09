@@ -7,24 +7,6 @@ import datetime
 from collections import deque
 from typing import Optional, NamedTuple, List, Tuple, Set
 
-# --- NAPLÓZÓ SEGÉDFÜGGVÉNY ---
-LOG_DIR = "logs"
-LOG_FILE = os.path.join(LOG_DIR, "debugG.txt")
-
-def ensure_log_dir():
-    if not os.path.exists(LOG_DIR):
-        os.makedirs(LOG_DIR)
-    with open(LOG_FILE, "w") as f:
-        f.write(f"--- START NEW GAME: {datetime.datetime.now()} ---\n")
-
-def log_msg(msg: str):
-    try:
-        with open(LOG_FILE, "a") as f:
-            timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            f.write(f"[{timestamp}] {msg}\n")
-    except Exception:
-        pass
-
 # --- JÁTÉK KONSTANSOK ---
 class CellType(enum.Enum):
     WALL = -1
@@ -134,17 +116,17 @@ def find_nearest_reachable_target(start: tuple[int, int], gmap: GlobalMap, occup
                     cell_val = gmap.grid[nx, ny]
                     
                     if cell_val == CellType.UNKNOWN.value:
-                        log_msg(f"  [FloodFill-{mode_str}] TALÁLAT (8-way)! UNKNOWN @ {(nx, ny)}")
+                        
                         return (nx, ny), 'UNKNOWN'
                     
                     if cell_val == CellType.GOAL.value:
-                        log_msg(f"  [FloodFill-{mode_str}] TALÁLAT (8-way)! GOAL @ {(nx, ny)}")
+                       
                         return (nx, ny), 'GOAL'
 
                     visited.add((nx, ny))
                     queue.append((nx, ny))
     
-    log_msg(f"  [FloodFill-{mode_str}] NEM talált célt {nodes} csomópont után.")
+    
     return None, 'NONE'
 
 def run_astar(start: tuple[int, int], goal: tuple[int, int], gmap: GlobalMap, occupied: Set[tuple[int, int]]):
@@ -217,7 +199,7 @@ def get_random_valid_move(state: State, gmap: GlobalMap) -> Tuple[int, int]:
 def calculate_move_logic(state: State, gmap: GlobalMap) -> Tuple[int, int]:
     my_pos = (state.agent.x, state.agent.y)
     
-    log_msg(f"=== KÖR START Pos:{my_pos} ===")
+    
     
     gmap.update(state.visible_track)
     
@@ -231,7 +213,7 @@ def calculate_move_logic(state: State, gmap: GlobalMap) -> Tuple[int, int]:
     
     # 2. 8-irányú Flood Fill (Laza)
     if target is None:
-        log_msg("  ! Szigorú keresés sikertelen, átváltás LAZA módra...")
+        
         target, t_type = find_nearest_reachable_target(my_pos, gmap, occupied_cells, ignore_players=True)
 
     path = []
@@ -240,7 +222,7 @@ def calculate_move_logic(state: State, gmap: GlobalMap) -> Tuple[int, int]:
     
     if path and len(path) >= 2:
         next_cell = path[1]
-        log_msg(f"  -> Útvonal OK. Következő: {next_cell}")
+        
         
         desired_pos = np.array(next_cell)
         current_pos = state.agent.pos
@@ -252,8 +234,8 @@ def calculate_move_logic(state: State, gmap: GlobalMap) -> Tuple[int, int]:
         ay = int(np.clip(acceleration[1], -1, 1))
         return (ax, ay)
     else:
-        log_msg("  !!! PÁNIK MÓD !!!")
-        return get_random_valid_move(state, gmap)
+        
+        return get_random_valid_move(state, gmap) # panik mód
 
 # --- INPUT/OUTPUT ---
 
@@ -312,7 +294,7 @@ def read_observation(old_state: State) -> Optional[State]:
         return None
 
 def main():
-    ensure_log_dir()
+    
     print('READY', flush=True)
     
     circuit = read_initial_observation()
