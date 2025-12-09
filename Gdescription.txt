@@ -1,0 +1,48 @@
+Globális Memória (GlobalMap) bevezetése
+
+Eredeti: Csak azt tudta, amit éppen látott (stateless). Ha elfordult, elfelejtette a falat.
+
+Új: Egy GlobalMap osztályban eltároljuk a pálya minden eddig látott mezőjét.
+
+Miért: Így a bot tud "térképet rajzolni", nem megy vissza oda, ahol már járt, és emlékszik a zsákutcákra.
+
+A kódod azért működik jól, mert a GlobalMap kezdetben egy HxW méretű "fekete doboz" (UNKNOWN mezőkkel). A stratégiánk ("Menj a legközelebbi UNKNOWN-hoz") matematikailag garantálja, hogy addig nem nyugszik a bot, amíg:
+
+Vagy meg nem találja a célt (GOAL).
+
+Vagy be nem járja a teljes HxW területet, amíg el nem fogy az összes UNKNOWN mező.
+
+
+Intelligens Célkeresés (Flood Fill / BFS)
+
+Eredeti: Véletlenszerűen mozgott vagy csak egyenesen ment.
+
+Új: Egy "Árvíz-szerű" kereséssel (BFS) megkeressük a legközelebbi olyan pontot, amit még nem láttunk (UNKNOWN) vagy a célt (GOAL).
+
+Miért: Ez adja meg a bot motivációját (felfedezés). A 8-irányú keresés (átlósan is) azért kellett, hogy átférjen a szűk, átlós réseken is, amiket a 4-irányú keresés falnak hitt.
+
+Útvonaltervezés (A Algoritmus)*
+
+Eredeti: Nem volt útvonaltervezés.
+
+Új: A* algoritmust használunk a megtalált cél eléréséhez.
+
+Miért: Ez megtalálja a legrövidebb utat, és ami fontosabb: elkerüli a homokot és olajat (magas költséget adtunk nekik), kivéve, ha nincs más út.
+
+Fizika és "Raycast Smoothing" (Gyorsítás)
+
+Eredeti: Mindig csak a szomszédos mezőre lépett, ezért lassú volt.
+
+Új: A bot előretekint az útvonalon ("Raycast"). Ha látja, hogy hosszan egyenes az út és nincs akadály, akkor kiszámolja a féktávot, és maximálisra gyorsít.
+
+Miért: Így az egyenesekben sokkal gyorsabb, de a kanyarok előtt időben lefékez, hogy ne csapódjon a falnak.
+
+. Beragadás elleni védelem (Robustness)
+
+Eredeti: Ha nem talált érvényes lépést, megállt (0,0) vagy random lépett.
+
+Új: Két védelmi vonal van:
+
+"Laza keresés": Ha egy másik játékos áll az ajtóban, a bot először úgy tervez, mintha ott se lenne (hogy odamenjen és "meglökje").
+
+Pánik Mód: Ha végképp nincs út (bug vagy bezártság), sosem áll meg, hanem véletlenszerűen mozog, hogy kiszabaduljon.
