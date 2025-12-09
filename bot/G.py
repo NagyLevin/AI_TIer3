@@ -2,8 +2,28 @@ import sys
 import enum
 import numpy as np
 import heapq
+import os
+import datetime
 from collections import deque
 from typing import Optional, NamedTuple, List, Tuple, Set
+
+# --- NAPLÓZÓ SEGÉDFÜGGVÉNY ---
+LOG_DIR = "logs"
+LOG_FILE = os.path.join(LOG_DIR, "debugG.txt")
+
+def ensure_log_dir():
+    if not os.path.exists(LOG_DIR):
+        os.makedirs(LOG_DIR)
+    with open(LOG_FILE, "w") as f:
+        f.write(f"--- START NEW GAME: {datetime.datetime.now()} ---\n")
+
+def log_msg(msg: str):
+    try:
+        with open(LOG_FILE, "a") as f:
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            f.write(f"[{timestamp}] {msg}\n")
+    except Exception:
+        pass
 
 # --- JÁTÉK KONSTANSOK ---
 class CellType(enum.Enum):
@@ -41,8 +61,7 @@ class State(NamedTuple):
     players: list[Player]
     agent: Player
 
-# --- NAVIGÁCIÓS LOGIKA ---
-
+# --- TÉRKÉP ---
 class GlobalMap:
     def __init__(self, shape):
         self.shape = shape
@@ -67,39 +86,69 @@ class GlobalMap:
             return False
         return self.grid[x, y] != CellType.WALL.value
 
-# MÓDOSÍTVA: Most már megkapja az occupied (foglalt) mezők halmazát is
-def find_nearest_unknown(start: tuple[int, int], gmap: GlobalMap, occupied: Set[tuple[int, int]]) -> Optional[tuple[int, int]]:
-    """BFS a legközelebbi SZABAD ismeretlen mezőre."""
+# --- ALGORITMUSOK ---
+
+def find_nearest_reachable_target(start: tuple[int, int], gmap: GlobalMap, occupied: Set[tuple[int, int]], ignore_players: bool = False) -> Tuple[Optional[tuple[int, int]], str]:
+    """
+    Flood Fill keresés (BFS).
+    JAVÍTVA: Most már 8 irányba keres (átlósan is)!
+    """
+    mode_str = "LAZA" if ignore_players else "SZIGORÚ"
+    
     queue = deque([start])
     visited = {start}
     
-    # Ha épp ismeretlenben állunk, és nem vagyunk blokkolva, maradhatunk
-    if gmap.grid[start] == CellType.UNKNOWN.value and start not in occupied:
-        return start
+    val_start = gmap.grid[start]
+    if val_start == CellType.UNKNOWN.value and (ignore_players or start not in occupied):
+        return start, 'UNKNOWN'
+    if val_start == CellType.GOAL.value:
+        return start, 'GOAL'
 
+    nodes = 0
     while queue:
         cx, cy = queue.popleft()
+        nodes += 1
         
-        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-            nx, ny = cx + dx, cy + dy
-            
-            if 0 <= nx < gmap.shape[0] and 0 <= ny < gmap.shape[1]:
-                if gmap.grid[nx, ny] == CellType.WALL.value:
-                    continue
+        # JAVÍTÁS ITT: 8 irányú szomszédság vizsgálata
+        for dx in range(-1, 2):
+            for dy in range(-1, 2):
+                if dx == 0 and dy == 0: continue
                 
-                # ÚJ: Ellenőrzés - ha ismeretlen, DE foglalt, akkor nem jó cél!
-                if gmap.grid[nx, ny] == CellType.UNKNOWN.value:
-                    if (nx, ny) not in occupied:
-                        return (nx, ny)
-                    # Ha foglalt, tovább keresünk (mintha fal lenne, vagy csak simán nem cél)
+                nx, ny = cx + dx, cy + dy
                 
-                if (nx, ny) not in visited:
+                # Pályán belül?
+                if 0 <= nx < gmap.shape[0] and 0 <= ny < gmap.shape[1]:
+                    
+                    # 1. FAL
+                    if gmap.grid[nx, ny] == CellType.WALL.value:
+                        continue
+                    
+                    if (nx, ny) in visited:
+                        continue
+                    
+                    # 2. JÁTÉKOSOK
+                    if not ignore_players and (nx, ny) in occupied:
+                        continue
+
+                    # 3. TALÁLAT
+                    cell_val = gmap.grid[nx, ny]
+                    
+                    if cell_val == CellType.UNKNOWN.value:
+                        log_msg(f"  [FloodFill-{mode_str}] TALÁLAT (8-way)! UNKNOWN @ {(nx, ny)}")
+                        return (nx, ny), 'UNKNOWN'
+                    
+                    if cell_val == CellType.GOAL.value:
+                        log_msg(f"  [FloodFill-{mode_str}] TALÁLAT (8-way)! GOAL @ {(nx, ny)}")
+                        return (nx, ny), 'GOAL'
+
                     visited.add((nx, ny))
                     queue.append((nx, ny))
-    return None
+    
+    log_msg(f"  [FloodFill-{mode_str}] NEM talált célt {nodes} csomópont után.")
+    return None, 'NONE'
 
-# MÓDOSÍTVA: A* is figyelembe veszi a többi játékost akadályként
 def run_astar(start: tuple[int, int], goal: tuple[int, int], gmap: GlobalMap, occupied: Set[tuple[int, int]]):
+    # Az A* már eddig is 8 irányú volt, ez jó.
     pq = [(0, start)]
     came_from = {start: None}
     cost_so_far = {start: 0}
@@ -119,12 +168,9 @@ def run_astar(start: tuple[int, int], goal: tuple[int, int], gmap: GlobalMap, oc
                 if not gmap.is_traversable(nx, ny):
                     continue
                 
-                # ÚJ: Dinamikus akadály elkerülés
-                # Ha a mezőn áll valaki (és nem az a célunk), akkor kerüljük el
-                # Nagyon nagy költséget adunk neki, így csak végszükség esetén megy arra
                 tile_cost = gmap.get_cost(nx, ny)
                 if (nx, ny) in occupied and (nx, ny) != goal:
-                    tile_cost += 1000 # "Lágy" fal: átmehetünk, ha nincs más, de inkább kerüljük
+                    tile_cost += 500 
 
                 new_cost = cost_so_far[current] + tile_cost
                 
@@ -145,126 +191,139 @@ def run_astar(start: tuple[int, int], goal: tuple[int, int], gmap: GlobalMap, oc
     path.reverse()
     return path
 
-# --- KOMMUNIKÁCIÓ ÉS MAIN ---
+def get_random_valid_move(state: State, gmap: GlobalMap) -> Tuple[int, int]:
+    possible_moves = []
+    current_vel = state.agent.vel
+    current_pos = state.agent.pos
+    
+    for ax in range(-1, 2):
+        for ay in range(-1, 2):
+            next_pos_x = current_pos[0] + current_vel[0] + ax
+            next_pos_y = current_pos[1] + current_vel[1] + ay
+            
+            if gmap.is_traversable(int(next_pos_x), int(next_pos_y)):
+                if ax != 0 or ay != 0:
+                     possible_moves.append((ax, ay))
+                else:
+                     possible_moves.append((ax, ay))
+
+    if possible_moves:
+        idx = np.random.randint(0, len(possible_moves))
+        return possible_moves[idx]
+    return (0, 0)
+
+# --- FŐ LOGIKA ---
+
+def calculate_move_logic(state: State, gmap: GlobalMap) -> Tuple[int, int]:
+    my_pos = (state.agent.x, state.agent.y)
+    
+    log_msg(f"=== KÖR START Pos:{my_pos} ===")
+    
+    gmap.update(state.visible_track)
+    
+    occupied_cells = set()
+    for p in state.players:
+        if (p.x, p.y) != my_pos:
+            occupied_cells.add((p.x, p.y))
+
+    # 1. 8-irányú Flood Fill (Szigorú)
+    target, t_type = find_nearest_reachable_target(my_pos, gmap, occupied_cells, ignore_players=False)
+    
+    # 2. 8-irányú Flood Fill (Laza)
+    if target is None:
+        log_msg("  ! Szigorú keresés sikertelen, átváltás LAZA módra...")
+        target, t_type = find_nearest_reachable_target(my_pos, gmap, occupied_cells, ignore_players=True)
+
+    path = []
+    if target is not None:
+        path = run_astar(my_pos, target, gmap, occupied_cells)
+    
+    if path and len(path) >= 2:
+        next_cell = path[1]
+        log_msg(f"  -> Útvonal OK. Következő: {next_cell}")
+        
+        desired_pos = np.array(next_cell)
+        current_pos = state.agent.pos
+        current_vel = state.agent.vel
+        needed_vel = desired_pos - current_pos
+        acceleration = needed_vel - current_vel
+        
+        ax = int(np.clip(acceleration[0], -1, 1))
+        ay = int(np.clip(acceleration[1], -1, 1))
+        return (ax, ay)
+    else:
+        log_msg("  !!! PÁNIK MÓD !!!")
+        return get_random_valid_move(state, gmap)
+
+# --- INPUT/OUTPUT ---
 
 def read_initial_observation() -> Circuit:
     line = sys.stdin.readline()
     if not line: return None
-    H, W, num_players, visibility_radius = map(int, line.split())
-    return Circuit((H, W), num_players, visibility_radius)
+    try:
+        parts = list(map(int, line.split()))
+        if len(parts) == 4:
+            H, W, num_players, visibility_radius = parts
+            return Circuit((H, W), num_players, visibility_radius)
+    except ValueError:
+        return None
+    return None
 
 def read_observation(old_state: State) -> Optional[State]:
     line = sys.stdin.readline()
     if not line or line.strip() == '~~~END~~~':
         return None
-    posx, posy, velx, vely = map(int, line.split())
-    agent = Player(posx, posy, velx, vely)
     
-    players = []
-    circuit_data = old_state.circuit
-    for _ in range(circuit_data.num_players):
-        pposx, pposy = map(int, sys.stdin.readline().split())
-        players.append(Player(pposx, pposy, 0, 0))
-    
-    visible_track = np.full(circuit_data.track_shape, CellType.NOT_VISIBLE.value)
-    for i in range(2 * circuit_data.visibility_radius + 1):
-        raw = sys.stdin.readline()
-        if not raw: break
-        vals = [int(a) for a in raw.split()]
+    try:
+        posx, posy, velx, vely = map(int, line.split())
+        agent = Player(posx, posy, velx, vely)
         
-        x = posx - circuit_data.visibility_radius + i
-        if x < 0 or x >= circuit_data.track_shape[0]: continue
-        y_start = posy - circuit_data.visibility_radius
-        y_end = y_start + 2 * circuit_data.visibility_radius + 1
+        players = []
+        circuit_data = old_state.circuit
+        for _ in range(circuit_data.num_players):
+            line_p = sys.stdin.readline()
+            if not line_p: break
+            pposx, pposy = map(int, line_p.split())
+            players.append(Player(pposx, pposy, 0, 0))
         
-        sl_start, sl_end = 0, len(vals)
-        tgt_y_start, tgt_y_end = max(0, y_start), min(circuit_data.track_shape[1], y_end)
-        
-        if y_start < 0: sl_start = -y_start
-        if y_end > circuit_data.track_shape[1]: sl_end -= (y_end - circuit_data.track_shape[1])
+        visible_track = np.full(circuit_data.track_shape, CellType.NOT_VISIBLE.value)
+        for i in range(2 * circuit_data.visibility_radius + 1):
+            raw = sys.stdin.readline()
+            if not raw: break
+            vals = [int(a) for a in raw.split()]
             
-        if sl_start < sl_end:
-            visible_track[x, tgt_y_start:tgt_y_end] = vals[sl_start:sl_end]
-
-    return old_state._replace(visible_track=visible_track, players=players, agent=agent)
-
-def get_alternative_goal(target: Tuple[int, int], gmap: GlobalMap, occupied: Set[Tuple[int, int]]) -> Tuple[int, int]:
-    """Ha a cél foglalt, keresünk egy szomszédos szabad mezőt."""
-    if target not in occupied:
-        return target
-    
-    # Körbenézünk a cél körül
-    for dx in range(-1, 2):
-        for dy in range(-1, 2):
-            nx, ny = target[0] + dx, target[1] + dy
-            if gmap.is_traversable(nx, ny) and (nx, ny) not in occupied:
-                return (nx, ny)
-    return target # Ha minden kötél szakad, marad az eredeti
-
-def calculate_move_logic(state: State, gmap: GlobalMap) -> Tuple[int, int]:
-    my_pos = (state.agent.x, state.agent.y)
-    
-    # ÚJ: Összeszedjük, hol vannak a többiek
-    occupied_cells = set()
-    for p in state.players:
-        # A players listában mi NEM vagyunk benne elvileg (GridRace függő), 
-        # de ha benne lennénk, magunkat ki kell szűrni.
-        # A judge.py alapján a players listában mindenki benne lehet, VAGY a circuit.players-ből jön.
-        # Biztonság kedvéért: ha a koordináta nem egyezik a miénkkel, akkor foglalt.
-        if (p.x, p.y) != my_pos:
-            occupied_cells.add((p.x, p.y))
-
-    gmap.update(state.visible_track)
-    
-    # 1. Célkeresés (figyelembe véve a foglalt mezőket)
-    target = find_nearest_unknown(my_pos, gmap, occupied_cells)
-    
-    if target is None:
-        # Ha nincs ismeretlen, keressük a GOAL-t
-        goals = np.argwhere(gmap.grid == CellType.GOAL.value)
-        if len(goals) > 0:
-            # Legközelebbi cél
-            dists = np.sum(np.abs(goals - np.array(my_pos)), axis=1)
-            raw_target = tuple(goals[np.argmin(dists)])
+            x = posx - circuit_data.visibility_radius + i
+            if x < 0 or x >= circuit_data.track_shape[0]: continue
             
-            # ÚJ: Ha a konkrét CÉLMEZŐN áll valaki, keressünk mellé alternatívát
-            target = get_alternative_goal(raw_target, gmap, occupied_cells)
-        else:
-            return (0, 0)
+            y_start = posy - circuit_data.visibility_radius
+            y_end = y_start + 2 * circuit_data.visibility_radius + 1
+            
+            sl_start, sl_end = 0, len(vals)
+            tgt_y_start, tgt_y_end = max(0, y_start), min(circuit_data.track_shape[1], y_end)
+            
+            if y_start < 0: sl_start = -y_start
+            if y_end > circuit_data.track_shape[1]: sl_end -= (y_end - circuit_data.track_shape[1])
+                
+            if sl_start < sl_end:
+                visible_track[x, tgt_y_start:tgt_y_end] = vals[sl_start:sl_end]
 
-    # 2. Útvonaltervezés (occupied átadva az A*-nak)
-    path = run_astar(my_pos, target, gmap, occupied_cells)
-    
-    if len(path) < 2:
-        return (0, 0)
-    
-    next_cell = path[1]
-    
-    # 3. Fizika
-    desired_pos = np.array(next_cell)
-    current_pos = state.agent.pos
-    current_vel = state.agent.vel
-    
-    needed_vel = desired_pos - current_pos
-    acceleration = needed_vel - current_vel
-    
-    ax = int(np.clip(acceleration[0], -1, 1))
-    ay = int(np.clip(acceleration[1], -1, 1))
-    
-    return (ax, ay)
+        return old_state._replace(visible_track=visible_track, players=players, agent=agent)
+    except ValueError:
+        return None
 
 def main():
+    ensure_log_dir()
     print('READY', flush=True)
+    
     circuit = read_initial_observation()
     if circuit is None: return
-    
+        
     gmap = GlobalMap(circuit.track_shape)
     state: Optional[State] = State(circuit, None, [], None) # type: ignore
     
     while True:
         state = read_observation(state)
         if state is None: break
-        
         dx, dy = calculate_move_logic(state, gmap)
         print(f'{dx} {dy}', flush=True)
 
