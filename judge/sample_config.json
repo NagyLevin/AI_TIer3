@@ -1,5 +1,5 @@
 {
-  "track_file": "maps/silverstone_oil_sand.png",
+  "track_file": "maps/blocked.png",
   "max_turns": 500,
-  "visibility_radius": 8
+  "visibility_radius": 5
 }

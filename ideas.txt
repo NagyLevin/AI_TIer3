@@ -1,0 +1,25 @@
+40 60 4 8
+40 → H
+
+A pálya magassága (sorok száma).
+
+A pálya x-koordinátája 0-tól 39-ig mehet.
+
+60 → W
+
+A pálya szélessége (oszlopok száma).
+
+A pálya y-koordinátája 0-tól 59-ig mehet.
+
+4 → num_players
+
+Összesen 4 játékos van a pályán (ebből az egyik vagy te, a többiek ellenfelek / botok).
+
+8 → visibility_radius
+
+A látótávolság sugara rácslépésekben.
+
+Tehát minden körben egy (2·8 + 1) × (2·8 + 1) = 17 × 17-es ablakot kapsz a pályáról a saját pozíciód körül.
+
+Ötlet, mi lenne ha az egész HxW-s részt bejárnánk, úgy hogy full mappingre törekedjünk, akkor csak megesz a cél
+úgy menjünk, hogy minél többet feltérképezzünk a HxW pályából, akár szubgoalokkal   
