@@ -10,9 +10,9 @@ class CellType(enum.Enum):
     """
     Map tile kódok
     """
-    WALL = -1           # Fal, kuka
+    WALL = -1           # Fal
     EMPTY = 0           # Aszfalt, mehet
-    START = 1           # Start vonal
+    START = 1           # Start
     UNKNOWN = -2        # Fog of war (felfedezni!)
     NOT_VISIBLE = 3     # cant see this
     OIL = 91            # oil, csúszik
@@ -62,13 +62,9 @@ class State(NamedTuple):
     agent: Player                 # Hol vagyok én
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# TÉRKÉP / MAP
-# ────────────────────────────────────────────────────────────────────────────────
-
 class GlobalMap:
     """
-    Perzisztens térkép
+    Egesz térkép
     """
 
     def __init__(self, shape: tuple[int, int]):
@@ -80,15 +76,11 @@ class GlobalMap:
         """
         Térkép frissítése
         """
-        # Mask: ami NEM 'nem látható' (tehát látszik)
+        # Mask: ami NEM latszik
         mask = (visible_track != CellType.NOT_VISIBLE.value)
         # Csak a látható részeket írjuk felül
         self.grid[mask] = visible_track[mask]
 
-
-# ────────────────────────────────────────────────────────────────────────────────
-# FELDERÍTÉS (BFS)
-# ────────────────────────────────────────────────────────────────────────────────
 
 def find_nearest_unknown(
     start: tuple[int, int],
@@ -184,17 +176,17 @@ def run_astar(
     ]
 
     while pq:  # Amíg van node
-        _, current = heapq.heappop(pq)  # Get best
+        _, current = heapq.heappop(pq)  # Get best _, azt jelenti hogy többet nem kell igy szoktak jelölni
         if current == goal:  # Célba értünk
             break
 
         cx, cy = current  # Current coords
 
-        for dx, dy in directions:  # Szomszédok
+        for dx, dy in directions:  # dx,dy delta azaz változás
             if dx == 0 and dy == 0: continue  # Skip self
             
-            nx, ny = cx + dx, cy + dy  # Next coords
-            # Bounds check
+            nx, ny = cx + dx, cy + dy  # nx,ny Next coords
+            # Bounds check palya hatarokon ne menjünk ki
             if not (0 <= nx < H and 0 <= ny < W): continue
 
             val = gmap.grid[nx, ny]  # Cella típusa
@@ -206,7 +198,8 @@ def run_astar(
             # Cost calc (hazard = 20, sima = 1)
             step_cost = 20.0 if val in HAZARDS else 1.0
 
-            new_cost = cost_so_far[current] + step_cost  # Új G-score
+            new_cost = cost_so_far[current] + step_cost  # Új G-score költség a starttól eddig a mezöig ha jobb akkor ez lehet az uj node lasd lenntebb
+            
 
             # Ha jobb utat találtunk vagy új a node
             if (nx, ny) not in cost_so_far or new_cost < cost_so_far[(nx, ny)]:
@@ -219,7 +212,7 @@ def run_astar(
     if goal not in came_from:  # Ha nem találtuk meg
         return []
 
-    # Path rekonstrukció visszafelé
+    # Path rekonstrukció visszafelé a celtol, ha megvan, eger sajt pelda vissza a celtol jobb otlet
     path: List[Tuple[int, int]] = []
     curr: Optional[Tuple[int, int]] = goal
     while curr is not None:  # Backtrack startig
@@ -229,13 +222,9 @@ def run_astar(
     return path
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# IO / KOMMUNIKÁCIÓ
-# ────────────────────────────────────────────────────────────────────────────────
-
 def read_initial_observation() -> Circuit:
     """
-    Init header olvasás
+    Kommunkication with the judege
     """
     line = sys.stdin.readline()  # Read line
     if not line: return None     # EOF check
@@ -315,10 +304,6 @@ def read_observation(old_state: State) -> Optional[State]:
     )
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# LOGIKA UTÓMUNKA
-# ────────────────────────────────────────────────────────────────────────────────
-
 def choose_next_free_cell_on_path(
     path: List[Tuple[int, int]],
     state: State
@@ -326,7 +311,7 @@ def choose_next_free_cell_on_path(
     """
     Útvonalon első üres hely keresése
     """
-    if len(path) < 2: return None  # Túl rövid út
+    if len(path) < 2: return None  # Túl rövid út legalabb a sart pozició és a cel ahova menni akarunk benne kell hogy legyen
 
     my_pos = (state.agent.x, state.agent.y)  # Saját pos
     # Többiek pozíciói (set)
@@ -379,7 +364,7 @@ def calculate_move_logic(state: State, gmap: GlobalMap) -> Tuple[int, int]:
 
         # A* (óvatosan)
         path = run_astar(my_pos, goal_tuple, gmap, avoid_hazards=True)
-        # Fallback: mehet homokon is
+        # Fallback: mehet homokon is ha el lenne zarva a cel homokkal vagy olajal
         if len(path) < 2:
             path = run_astar(my_pos, goal_tuple, gmap, avoid_hazards=False)
 
@@ -391,8 +376,8 @@ def calculate_move_logic(state: State, gmap: GlobalMap) -> Tuple[int, int]:
                 # PD controller
                 return control_to_cell(state, next_cell)
 
-    # 3. Exploration (nincs cél)
-    # Legközelebbi unknown keresése (óvatosan)
+    # 3. Exploration if nincs cél
+    # Legközelebbi unknown keresése kerüljök ki a hazardokat
     target = find_nearest_unknown(my_pos, gmap, avoid_hazards=True)
     allow_hazards_for_explore = False
 
@@ -481,10 +466,6 @@ def control_to_cell(state: State, next_cell: tuple[int, int]) -> Tuple[int, int]
 
     return best_acc  # Return best move
 
-
-# ────────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ────────────────────────────────────────────────────────────────────────────────
 
 def main():
     """
