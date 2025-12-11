@@ -138,11 +138,6 @@ def find_nearest_unknown(
 
     return None  # Nincs találat
 
-
-# ────────────────────────────────────────────────────────────────────────────────
-# PATHFINDING (A*)
-# ────────────────────────────────────────────────────────────────────────────────
-
 def run_astar(
     start: tuple[int, int],
     goal: tuple[int, int],
