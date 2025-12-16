@@ -454,10 +454,10 @@ The Tier 3 solution is **robust and computationally efficient**:
      - fail to brake early enough,
      - and end up crashing because it didn’t plan braking distance 2–3 steps in advance.
 
-2. **Reactive enemy handling (no trajectory prediction)**  
+2. **Reactive agent handling (no trajectory prediction)**  
    - Other agents are treated as **static obstacles** at their current positions.  
    - The agent does not model where enemies will be at `t+1, t+2, ...`, so:
-     - it may plan a safe-looking path that becomes blocked by a moving enemy a turn later,
+     - it may plan a safe-looking path that becomes blocked by a moving agents a turn later,
      - there is no anticipation this spot will be occupied, better avoid it now.
 
 3. **Conservative acceleration in the final solution**  
@@ -485,14 +485,37 @@ The Tier 3 solution is **robust and computationally efficient**:
      - assume they keep their current velocity,
      - predict their positions at `t+1` (or `t+1..t+2`),
      - mark those predicted cells as temporarily forbidden or high cost in the planner.
-   - This would turn enemy handling from purely reactive (“oops, they’re in front of me now”) into **anticipatory avoidance** (choosing a lane or timing that avoids collisions altogether).
+   - This would turn agent handling from purely reactive (“oops, they’re in front of me now”) into **anticipatory avoidance** (choosing a lane or timing that avoids collisions altogether).
 
 3. **Smarter speed policy (tighter risk–speed tradeoff)**  
    - With lookahead braking logic in place, the controller could safely use **more aggressive acceleration** on straights:
      - higher target speeds when braking distance is sufficient,
      - automatic early braking when approaching tight corners or unknown areas.
    - This would partly recover the raw speed of the Tier 2 ideas, but with **explicit safety checks** instead of purely heuristic trust.
+4. **Physics-aware A* (state = position + velocity)**  
+   - I also tried an alternative planner that searches in **kinematic state space** instead of just grid cells:
+     - node = `(x, y, vx, vy)`,
+     - action = `(ax, ay)` where `ax, ay ∈ {-1, 0, 1}`,
+     - transition = `v' = v + a`, `p' = p + v'`.
+   - Why its a good solution?
+     - it enables **fast straight-line driving** (speed > 1) without the one-cell at a time logic that i currenty use
+     - it can plan acceleration and braking
+   - Key safety detail when speed > 1:
+     - each move checks between old and new position (Bresenham-ish walk),
+     - prevents me from “wall clipping” / skipping through obstacles just because the endpoint is free.
+   - Practical add-ons that made it usable:
+     - **lookahead target selection** (aim a few cells ahead on the A* path so speed-up is actually worth it),
+     - **speed caps** (try higher caps first, fall back to lower caps if it becomes unsafe/blocked),
+     - treat other players as **blocked goal/blocked landing cells** for the kinematic planner.
 
+   - Status / why it didn’t make it into the final submission:
+     - This method **works** and is probably **stronger / faster** than what I submitted.
+     - However, I opted for a more **stable and well-tested** version for the project delivery.
+     - The submitted solution is likely **safer** less moving parts, fewer edge cases 
+       even if it leaves some speed on the table.
+   - Conclusion:
+     - Kept it as a strong candidate for future improvement: promising performance upside,
+       but needs more testing / tuning to be used on all maps.
 ---
 
 In summary: the final solution trades some potential speed for **robustness and predictability**, which was intentional given the hidden test tracks. With multi-step lookahead and basic opponent prediction, it could be pushed towards a faster, more “risky” exploring style without losing that robustness.
